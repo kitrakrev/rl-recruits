@@ -1,23 +1,9 @@
 {
-  "random": {
-    "mean_reward": -45.9159,
-    "mean_profit": -55249.2,
-    "max_profit": -27745.19,
-    "min_profit": -68437.5,
+  "grpo_mc_training": {
+    "mean_reward": 0.05,
+    "mean_profit": 0.0,
+    "max_profit": 0.0,
+    "min_profit": 0.0,
     "positive_profit_rate": 0.0
-  },
-  "greedy": {
-    "mean_reward": 0.371,
-    "mean_profit": -17921.31,
-    "max_profit": 3903.85,
-    "min_profit": -46341.35,
-    "positive_profit_rate": 0.067
-  },
-  "optimal_heuristic": {
-    "mean_reward": -0.8702,
-    "mean_profit": -11512.5,
-    "max_profit": 14725.96,
-    "min_profit": -37875.0,
-    "positive_profit_rate": 0.2
   }
 }
