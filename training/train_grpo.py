@@ -16,7 +16,7 @@ Run (dry run — no GPU, validates full HTTP stack):
 Load hyperparameters from YAML (overridable by CLI flags):
     uv run python training/train_grpo.py --config training/config.yaml
 
-All hyperparameters live in env/config.py → TrainingConfig.
+All hyperparameters live in training/config.py → TrainingConfig.
 All constants (penalties, reward scaling) live in env/config.py → Config.
 The environment config is hot-patchable at runtime via PATCH /config/env.
 """
@@ -83,7 +83,7 @@ def main() -> None:
     args = parse_args()
     Path("training").mkdir(exist_ok=True)
 
-    from env.config import TrainingConfig
+    from training.config import TrainingConfig
 
     # Build config: YAML base (if given) then CLI overrides
     if args.config:

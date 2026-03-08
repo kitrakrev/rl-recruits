@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from env.config import TrainingConfig
+    from training.config import TrainingConfig
 
 
 def train_grpo(cfg: "TrainingConfig") -> None:
@@ -50,9 +50,10 @@ def train_grpo(cfg: "TrainingConfig") -> None:
         import torch
         import torch.nn.functional as F
         from transformers import AutoTokenizer, AutoModelForCausalLM
+        from peft import LoraConfig, get_peft_model, TaskType
     except ImportError as e:
         print(f"[!] Missing dependency: {e}")
-        print("    Run: uv pip install transformers torch")
+        print("    Run: uv pip install transformers torch peft")
         sys.exit(1)
 
     try:
@@ -96,27 +97,35 @@ def train_grpo(cfg: "TrainingConfig") -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
+    base_model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",
     )
 
-    # Reference model (frozen) for KL penalty
-    print("  Loading reference model for KL penalty...")
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        cfg.model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
+    # Wrap with LoRA — only adapter weights are trained (~0.5% of params).
+    # This keeps total VRAM well under 80GB even on 8B models, and eliminates
+    # the need for a separate frozen reference model: we compute KL by
+    # temporarily disabling the adapters on the SAME model object.
+    lora_cfg = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=cfg.lora_rank,
+        lora_alpha=cfg.lora_alpha,
+        lora_dropout=cfg.lora_dropout,
+        target_modules=cfg.lora_target_modules,
+        bias="none",
     )
-    ref_model.eval()
-    for param in ref_model.parameters():
-        param.requires_grad = False
+    model = get_peft_model(base_model, lora_cfg)
+    model.print_trainable_parameters()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
+    # Only optimise the LoRA adapter parameters
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=cfg.learning_rate,
+    )
 
     print(f"\nStarting REINFORCE-GRPO training")
-    print(f"  model:    {cfg.model_name}")
+    print(f"  model:    {cfg.model_name}  (LoRA r={cfg.lora_rank} α={cfg.lora_alpha})")
     print(f"  env:      {cfg.env_url}")
     print(f"  episodes: {cfg.num_episodes}  (each = 52-week rollout + policy update)")
     print(f"  gamma:    {cfg.gamma}  kl_coeff: {cfg.kl_coeff}  lr: {cfg.learning_rate}\n")
@@ -213,17 +222,18 @@ def train_grpo(cfg: "TrainingConfig") -> None:
 
                 completion_ids = full_ids[:, comp_start:]
 
-                # Policy log-probs
-                logits     = model(full_ids).logits[:, comp_start - 1 : -1, :]
-                log_probs  = F.log_softmax(logits, dim=-1)
-                tok_lp     = log_probs.gather(2, completion_ids.unsqueeze(-1)).squeeze(-1)
-                avg_log_p  = tok_lp.mean()
+                # Policy log-probs (LoRA adapters active)
+                logits    = model(full_ids).logits[:, comp_start - 1 : -1, :]
+                log_probs = F.log_softmax(logits, dim=-1)
+                tok_lp    = log_probs.gather(2, completion_ids.unsqueeze(-1)).squeeze(-1)
+                avg_log_p = tok_lp.mean()
 
-                # Reference model log-probs (KL penalty)
-                with torch.no_grad():
-                    ref_logits  = ref_model(full_ids).logits[:, comp_start - 1 : -1, :]
-                    ref_log_p   = F.log_softmax(ref_logits, dim=-1)
-                    ref_tok_lp  = ref_log_p.gather(2, completion_ids.unsqueeze(-1)).squeeze(-1)
+                # Reference log-probs: base model = disable LoRA adapters temporarily.
+                # This avoids loading a second full-size model copy.
+                with torch.no_grad(), model.disable_adapter():
+                    ref_logits = model(full_ids).logits[:, comp_start - 1 : -1, :]
+                    ref_log_p  = F.log_softmax(ref_logits, dim=-1)
+                    ref_tok_lp = ref_log_p.gather(2, completion_ids.unsqueeze(-1)).squeeze(-1)
 
                 # Per-token KL: p * (log p − log q)
                 kl = (tok_lp.exp() * (tok_lp - ref_tok_lp)).mean()
@@ -273,9 +283,11 @@ def train_grpo(cfg: "TrainingConfig") -> None:
     # Save model + plots
     # ------------------------------------------------------------------
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+    # save_pretrained on a PeftModel saves only the small LoRA adapter weights.
+    # To load later: model = PeftModel.from_pretrained(base_model, cfg.output_dir)
     model.save_pretrained(cfg.output_dir)
     tokenizer.save_pretrained(cfg.output_dir)
-    print(f"\n[✓] Training complete. Model saved to {cfg.output_dir}")
+    print(f"\n[✓] Training complete. LoRA adapter saved to {cfg.output_dir}")
 
     if wb_run is not None:
         wb_run.finish()

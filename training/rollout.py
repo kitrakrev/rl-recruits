@@ -10,13 +10,19 @@ rollout_episode       — OpenEnv-compatible rollout that accepts any callable
 from __future__ import annotations
 
 import json
+import re
 import random
 from typing import TYPE_CHECKING, Callable
 
 from training.prompts import SYSTEM_PROMPT, TOOLS, parse_tool_call
 
 if TYPE_CHECKING:
-    from env.config import TrainingConfig
+    from training.config import TrainingConfig
+
+
+def _strip_think(text: str) -> str:
+    """Remove Qwen3 <think>...</think> reasoning blocks from generated text."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +50,7 @@ def rollout_full_episode(
     Parameters
     ----------
     env         : StaffingAgencyEnv context manager (already opened)
-    model       : HuggingFace AutoModelForCausalLM
+    model       : HuggingFace AutoModelForCausalLM (may be a PeftModel)
     tokenizer   : matching AutoTokenizer
     seed        : episode seed (controls env stochasticity)
     max_turns_per_step : max tool calls per week before auto-advancing
@@ -64,12 +70,18 @@ def rollout_full_episode(
 
     # Resolve generation settings from cfg or use safe defaults
     max_prompt_len = cfg.max_prompt_len if cfg else 2048
-    max_full_len   = cfg.max_full_len   if cfg else 2560
     max_new_tokens = cfg.max_new_tokens if cfg else 512
-    temperature    = cfg.temperature    if cfg else 0.8
+    temperature    = cfg.temperature    if cfg else 0.7
+    top_p          = cfg.top_p          if cfg else 0.8
+    top_k          = cfg.top_k          if cfg else 20
+
+    # Left-truncate so the generation prompt always stays at the end of the
+    # context window.  Right-truncation would cut the "<|im_start|>assistant"
+    # suffix, causing the model to complete a half-open tool_call from history.
+    tokenizer.truncation_side = "left"
 
     env.reset(seed=seed)
-    prompts_out: list[str]   = []
+    prompts_out: list[str]    = []
     completions_out: list[str] = []
     step_rewards: list[float]  = []
     cumulative_env_reward: float = 0.0
@@ -110,17 +122,31 @@ def rollout_full_episode(
     prev_profit = final_profit
     for week in range(1, 53):
         week_advanced = False
+        parse_fail_streak = 0
+
         for turn in range(1, max_turns_per_step + 1):
-            prompt_str = tokenizer.apply_chat_template(
-                conversation,
-                tools=TOOLS,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+            # ---- Render prompt ------------------------------------------------
+            try:
+                prompt_str = tokenizer.apply_chat_template(
+                    conversation,
+                    tools=TOOLS,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,  # Qwen3: disable <think> blocks for tool calls
+                )
+            except TypeError:
+                # Older model / tokenizer that doesn't support enable_thinking
+                prompt_str = tokenizer.apply_chat_template(
+                    conversation,
+                    tools=TOOLS,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
 
             if week == 1 and turn == 1:
-                print(f"DEBUG: First rendered prompt (truncated):\n{prompt_str[:800]}...")
+                print(f"  [prompt sample] ...{prompt_str[-300:]}\n")
 
+            # ---- Tokenise (left-truncate) ------------------------------------
             input_ids = tokenizer(
                 prompt_str,
                 return_tensors="pt",
@@ -128,27 +154,35 @@ def rollout_full_episode(
                 max_length=max_prompt_len,
             ).to(model.device)
 
+            # ---- Generate ----------------------------------------------------
             with torch.no_grad():
                 out_ids = model.generate(
                     **input_ids,
                     max_new_tokens=max_new_tokens,
                     do_sample=True,
                     temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
                     pad_token_id=tokenizer.pad_token_id,
                 )
 
+            # Only decode the newly generated tokens — not the prompt.
+            # Parsing the full sequence caused the model to "re-trigger" old
+            # tool calls that were already in the conversation history.
             completion_ids = out_ids[0][input_ids.input_ids.shape[-1]:]
             completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
 
-            # Decode full output so we catch tool calls pre-filled by the chat template
-            full_text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
-            parsed = parse_tool_call(full_text) or parse_tool_call(completion_text)
+            # Strip any Qwen3 thinking blocks that leaked through despite enable_thinking=False
+            completion_text = _strip_think(completion_text)
+
+            parsed = parse_tool_call(completion_text)
 
             reward = 0.0
             final_cash = 0.0
             tool_result_text = "No tool parsed — no action taken."
 
             if parsed:
+                parse_fail_streak = 0
                 tool_name, params = parsed
                 try:
                     result = env.step(StaffingAction(tool=tool_name, params=params))
@@ -160,26 +194,22 @@ def rollout_full_episode(
                     profit_delta = final_profit - prev_profit
                     prev_profit = final_profit
 
-                    status = "PROFIT" if profit_delta > 0 else ("LOSS" if profit_delta < 0 else "NEUTRAL")
+                    status = "+" if profit_delta > 0 else ("-" if profit_delta < 0 else "=")
                     print(
-                        f"      Week {week:2d} Turn {turn:2d}: {tool_name:25s} | "
-                        f"{status:7s} | Cash: ${final_cash:>9,.0f} | "
-                        f"Profit: ${final_profit:>9,.0f} | ΔProfit: ${profit_delta:+,.0f} | "
-                        f"Reward: {reward:+.2f}"
+                        f"  W{week:02d}T{turn:02d} {tool_name:25s} "
+                        f"{status} cash=${final_cash:>8,.0f}  ΔP={profit_delta:>+8,.0f}  rew={reward:>+8.2f}"
                     )
 
                     if tool_name == "advance_week":
                         week_advanced = True
                 except Exception as e:
                     tool_result_text = f"Error: {e}"
+                    print(f"  W{week:02d}T{turn:02d} {tool_name:25s} ! ERROR: {e}")
             else:
+                parse_fail_streak += 1
                 clean = completion_text.strip().replace("\n", " ")
-                print(
-                    f"      Week {week:2d} Turn {turn:2d}: [invalid syntax]            | "
-                    f"FAILED  | Cash: ${final_cash:>9,.0f} | "
-                    f"Profit: ${final_profit:>9,.0f} | Reward: +0.00"
-                )
-                print(f"        DEBUG RAW: {clean[:120]}...")
+                print(f"  W{week:02d}T{turn:02d} [parse-fail #{parse_fail_streak}]"
+                      f"              = cash=${final_cash:>8,.0f}  raw: {clean[:100]}")
 
             prompts_out.append(prompt_str)
             completions_out.append(completion_text)
@@ -189,45 +219,70 @@ def rollout_full_episode(
             if week_advanced:
                 break
 
-            # Build next conversation turn
+            # ---- Build next conversation turn --------------------------------
             tool_call_id = f"call_{rng.getrandbits(32):08x}"
-            assistant_msg: dict = {"role": "assistant", "content": completion_text}
-            if parsed:
-                assistant_msg["tool_calls"] = [{
-                    "id": tool_call_id,
-                    "type": "function",
-                    "function": {"name": parsed[0], "arguments": parsed[1]},
-                }]
-            conversation.append(assistant_msg)
 
             if parsed:
+                # Standard: assistant made a valid tool call
+                conversation.append({
+                    "role": "assistant",
+                    "content": None,  # avoid double-rendering by the chat template
+                    "tool_calls": [{
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": parsed[0],
+                            "arguments": json.dumps(parsed[1]),
+                        },
+                    }],
+                })
                 conversation.append({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "name": parsed[0],
                     "content": tool_result_text,
                 })
+            elif parse_fail_streak >= 3:
+                # Hard-reset: accumulated broken context makes things worse.
+                # Start fresh with system prompt + a strict minimal prompt.
+                print(f"  W{week:02d}   [HARD-RESET after {parse_fail_streak} parse fails]")
+                parse_fail_streak = 0
+                conversation = [
+                    conversation[0],  # keep system prompt
+                    {
+                        "role": "user",
+                        "content": (
+                            f"[Week {week} of 52] Your previous responses could not be parsed. "
+                            "You MUST respond with a tool call and NOTHING else. Example:\n"
+                            '<tool_call>\n{"name": "find_candidate", "arguments": {"developer_type": "backend"}}\n</tool_call>\n'
+                            "Available tools: find_candidate, interview_candidate, hire_candidate, "
+                            "negotiate_salary, match_candidate_to_project, get_client_state, "
+                            "get_candidate_state, advance_week. Make a tool call now."
+                        ),
+                    },
+                ]
             else:
+                # Soft nudge: append the broken output and ask to retry
+                conversation.append({"role": "assistant", "content": completion_text})
                 conversation.append({
                     "role": "user",
                     "content": (
-                        "No tool call found. Call one of the available tools using "
-                        'the native format, e.g.:\n<tool_call>\n{"name": "get_agency_state", '
-                        '"arguments": {}}\n</tool_call>'
+                        "No tool call detected. You MUST respond with ONLY a tool call, no prose. "
+                        "Use this exact format:\n"
+                        '<tool_call>\n{"name": "find_candidate", "arguments": {"developer_type": "backend"}}\n</tool_call>'
                     ),
                 })
 
         # Auto-advance if model never called advance_week
         if not week_advanced:
-            print(f"      Week {week:2d}: [Max turns reached — auto-advancing]")
+            print(f"  W{week:02d}   [auto-advance — max turns reached]")
             try:
                 result = env.step(StaffingAction(tool="advance_week", params={}))
                 final_profit = float(result.observation.profit or 0.0)
-                # Capture the auto-advance reward too
                 auto_reward = float(result.reward or 0.0)
                 step_rewards.append(auto_reward)
                 cumulative_env_reward += auto_reward
-                prompts_out.append("")       # placeholder — no model output for auto-advance
+                prompts_out.append("")        # placeholder — no model output for auto-advance
                 completions_out.append("")
             except Exception:
                 pass
@@ -257,7 +312,7 @@ def rollout_full_episode(
             ),
         }]
 
-    print(f"      --- Episode Outcome: Profit=${final_profit:,.0f}  EnvReward={cumulative_env_reward:+,.2f} ---")
+    print(f"  --- Episode done: profit=${final_profit:,.0f}  total_reward={cumulative_env_reward:+,.2f} ---")
     return prompts_out, completions_out, step_rewards, final_profit, cumulative_env_reward
 
 
@@ -278,12 +333,12 @@ def rollout_episode(
 
     Parameters
     ----------
-    env_client       : OpenEnv client (supports .reset() and .step())
+    env_client        : OpenEnv client (supports .reset() and .step())
     model_generate_fn : callable(prompt_ids) → {"completion_ids": tensor, "logprobs": ...}
-    tokenizer        : matching tokenizer
-    system_prompt    : system message text
-    max_turns        : maximum tool calls per episode
-    seed             : optional seed passed to env.reset()
+    tokenizer         : matching tokenizer
+    system_prompt     : system message text
+    max_turns         : maximum tool calls per episode
+    seed              : optional seed passed to env.reset()
 
     Returns
     -------
@@ -312,15 +367,23 @@ def rollout_episode(
     cumulative_reward = 0.0
 
     for turn in range(max_turns):
-        prompt_text = tokenizer.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=True
-        )
+        try:
+            prompt_text = tokenizer.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            prompt_text = tokenizer.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=True,
+            )
         prompt_ids = tokenizer.encode(prompt_text, return_tensors="pt")
 
         outputs = model_generate_fn(prompt_ids)
         completion_ids = outputs["completion_ids"]
         logprobs = outputs.get("logprobs")
-        completion_text = tokenizer.decode(completion_ids[0], skip_special_tokens=True)
+        completion_text = _strip_think(
+            tokenizer.decode(completion_ids[0], skip_special_tokens=True)
+        )
 
         parsed = parse_tool_call(completion_text)
         reward = 0.0

@@ -1,0 +1,107 @@
+_wandb:
+    value:
+        cli_version: 0.25.0
+        e:
+            oj6eyhs0gj4zk0zbtyuy9txufmwhcetg:
+                args:
+                    - --env_url
+                    - http://localhost:8000/
+                    - --model_name
+                    - Qwen/Qwen2.5-1.5B-Instruct
+                    - --num_episodes
+                    - "10"
+                    - --output_dir
+                    - training/checkpoints
+                    - --wandb_api_key
+                    - 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
+                    - --wandb_project
+                    - kanandan-university-of-california/Staffing_agent
+                codePath: training/train_grpo.py
+                codePathLocal: training/train_grpo.py
+                cpu_count: 64
+                cpu_count_logical: 128
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "30723257925632"
+                        used: "775504068608"
+                email: kanandan@ucsc.edu
+                executable: /mnt/data/rl-recruits/.venv/bin/python3
+                git:
+                    commit: f168dff256c66527a1ece388a1b0c1bc941cb477
+                    remote: git@github.com:kitrakrev/rl-recruits.git
+                gpu: NVIDIA H100 80GB HBM3
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-961d8834-6e80-4d2b-3654-53d86296df3a
+                host: ubuntu-55fcf556f9-mnkpg
+                memory:
+                    total: "2162529890304"
+                os: Linux-6.8.12-680-6063-coreweave-amd64-f81899c8-x86_64-with-glibc2.35
+                program: /mnt/data/rl-recruits/training/train_grpo.py
+                python: CPython 3.11.13
+                root: /mnt/data/rl-recruits
+                startedAt: "2026-03-08T15:45:41.570642Z"
+                writerId: oj6eyhs0gj4zk0zbtyuy9txufmwhcetg
+        m: []
+        python_version: 3.11.13
+        t:
+            "1":
+                - 1
+                - 11
+                - 49
+                - 71
+                - 95
+            "2":
+                - 1
+                - 11
+                - 49
+                - 71
+                - 95
+            "3":
+                - 16
+            "4": 3.11.13
+            "5": 0.25.0
+            "6": 5.3.0
+            "12": 0.25.0
+            "13": linux-x86_64
+dry_run:
+    value: false
+env_url:
+    value: http://localhost:8000/
+gamma:
+    value: 0.99
+kl_coeff:
+    value: 0.05
+learning_rate:
+    value: 5e-06
+max_full_len:
+    value: 2560
+max_grad_norm:
+    value: 1
+max_new_tokens:
+    value: 512
+max_prompt_len:
+    value: 2048
+max_turns_per_step:
+    value: 10
+model_name:
+    value: Qwen/Qwen2.5-1.5B-Instruct
+num_episodes:
+    value: 10
+output_dir:
+    value: training/checkpoints
+seed:
+    value: 42
+temperature:
+    value: 0.8
+train_batch_size:
+    value: 4
+wandb_api_key:
+    value: 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
+wandb_project:
+    value: kanandan-university-of-california/Staffing_agent

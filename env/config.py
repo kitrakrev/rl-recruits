@@ -1,17 +1,15 @@
 """
-All tunable parameters for the Staffing Agency RL environment and training loop.
+Environment configuration for the Staffing Agency RL simulation.
 
-Environment config  → Config (passed to StaffingAgencyEnvironment)
-Training config     → TrainingConfig (used by training/reinforce.py)
+Config  — passed to StaffingAgencyEnvironment; controls episode length,
+          economics, curriculum stage, LLM mode, and server-side penalties.
+          Live-patchable via PATCH /config/env.
 
-Both can be overridden via:
-  - Constructor args
-  - YAML file (TrainingConfig.from_yaml / Config.from_yaml)
-  - PATCH /config/env API endpoint (env config only, live reload)
+Training hyperparameters live in training/config.py → TrainingConfig.
 """
 import os
 from dataclasses import dataclass, field, fields as dc_fields
-from typing import Literal, Any
+from typing import Literal, Any  # Any used in Config.update()
 
 
 @dataclass
@@ -137,75 +135,3 @@ class Config:
                 pass
         return changed
 
-
-# ---------------------------------------------------------------------------
-# Training hyperparameters
-# ---------------------------------------------------------------------------
-
-@dataclass
-class TrainingConfig:
-    """
-    All hyperparameters for the REINFORCE-GRPO training loop.
-
-    Configurable via:
-      - Constructor:  TrainingConfig(learning_rate=1e-5)
-      - YAML file:    TrainingConfig.from_yaml("training/config.yaml")
-      - CLI args:     TrainingConfig.from_args(parsed_args)
-    """
-
-    # --- Model ---
-    # Qwen2.5-7B-Instruct: native <tool_call> JSON format, best-in-class tool use,
-    # ~14GB bfloat16 (×2 with ref model = 28GB — fits H100 80GB comfortably).
-    model_name: str = "Qwen/Qwen2.5-7B-Instruct"
-
-    # --- Optimisation ---
-    learning_rate: float = 5e-6
-    gamma: float = 0.99          # discount factor for returns
-    kl_coeff: float = 0.05       # KL penalty weight (prevents divergence from base model)
-    train_batch_size: int = 4    # steps per gradient accumulation batch
-    max_grad_norm: float = 1.0   # gradient clipping threshold
-
-    # --- Generation ---
-    max_turns_per_step: int = 10  # max tool calls per episode-week before forced advance
-    max_prompt_len: int = 2048    # tokenisation truncation for prompt
-    max_full_len: int = 2560      # tokenisation truncation for prompt+completion
-    max_new_tokens: int = 512     # model generation budget per turn
-    temperature: float = 0.8      # sampling temperature
-
-    # --- Experiment ---
-    num_episodes: int = 200
-    seed: int = 42
-    output_dir: str = "training/checkpoints"
-    env_url: str = "http://localhost:8000"
-
-    # --- W&B ---
-    wandb_project: str = "kanandan-university-of-california/Staffing_agent"
-    wandb_api_key: str = field(default_factory=lambda: os.getenv("WANDB_API_KEY", ""))
-
-    # --- Dry-run ---
-    dry_run: bool = False
-
-    @classmethod
-    def from_yaml(cls, path: str) -> "TrainingConfig":
-        """Load from a YAML file (only keys that exist on the dataclass are used)."""
-        try:
-            import yaml
-        except ImportError:
-            raise ImportError("PyYAML required: uv pip install pyyaml")
-        with open(path) as f:
-            data = yaml.safe_load(f) or {}
-        valid = {f.name for f in dc_fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in valid})
-
-    @classmethod
-    def from_args(cls, args: Any) -> "TrainingConfig":
-        """Build from an argparse Namespace, overriding only non-None fields."""
-        cfg = cls()
-        for f in dc_fields(cfg):
-            val = getattr(args, f.name, None)
-            if val is not None:
-                setattr(cfg, f.name, val)
-        return cfg
-
-    def to_dict(self) -> dict:
-        return {f.name: getattr(self, f.name) for f in dc_fields(self)}

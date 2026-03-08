@@ -46,8 +46,8 @@ STRATEGY HINTS:
 - Use negotiate_salary to lower a candidate's salary before hiring them
 - Check bill_rate_weekly on each role before committing a candidate - only place where margin > 0
 - Use get_market_demand to identify which developer types are most needed
-- Confirm projects before committing candidates (confirm_project)
-- Pass on projects where you cannot fill all roles - preventing expiry avoids the penalty
+- Check get_client_state to see open projects and their deadlines before committing candidates
+- Pass on projects where you cannot fill all roles — preventing expiry avoids the penalty
 - Let go of benched candidates whose salary exceeds any available bill rate (they lose money)
 
 Use the available tools to manage your agency. Think step by step.
@@ -111,6 +111,11 @@ TOOLS: list[dict] = [
         "description": "See which roles are currently most requested by clients.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
+        "name": "confirm_project",
+        "description": "Commit to taking on a project from a client.",
+        "parameters": {"type": "object", "properties": {
+            "project_id": {"type": "string"}}, "required": ["project_id"]}}},
+    {"type": "function", "function": {
         "name": "advance_week",
         "description": (
             "Finish all actions for the current week and advance simulation time. "
@@ -140,11 +145,16 @@ def parse_tool_call(text: str) -> tuple[str, dict] | None:
     # Strip <think>...</think> reasoning blocks before parsing
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
+    # Strip Qwen special tokens that sometimes bleed into tool_call blocks
+    text = re.sub(r"<\|im_start\|>[^\n]*\n?", "", text)
+    text = re.sub(r"<\|im_end\|>", "", text)
+
     # 1. Native <tool_call>...</tool_call> tags
     all_matches = list(re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL))
     native_match = all_matches[-1] if all_matches else None
     if native_match:
-        content = native_match.group(1).strip()
+        # Strip any leftover Qwen role tokens from inside the block
+        content = re.sub(r"<\|[^|]+\|>", "", native_match.group(1)).strip()
 
         # a) JSON format: {"name": "...", "arguments": {...}}
         try:

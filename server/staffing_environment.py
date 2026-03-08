@@ -21,7 +21,9 @@ Reward flow (IMPORTANT):
 """
 from __future__ import annotations
 
+import logging
 import os
+import traceback
 from uuid import uuid4
 from typing import Any
 
@@ -33,6 +35,8 @@ from openenv.core.env_server.types import Observation
 from env.config import Config
 from env.llm import LLMRouter
 from models import StaffingState, StaffingObservation
+
+logger = logging.getLogger("staffing.env")
 
 
 # ---------------------------------------------------------------------------
@@ -62,14 +66,46 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         "get_market_demand", "get_financial_summary",
     })
 
+    # Canonical valid arguments per tool. Any extra args the LLM hallucinates
+    # are silently stripped before FastMCP validates the call — preventing
+    # ValidationError and the zero-reward black hole it creates.
+    _TOOL_VALID_ARGS: dict[str, frozenset[str]] = {
+        "get_agency_state":          frozenset(),
+        "get_client_state":          frozenset({"client_id"}),
+        "get_candidate_state":       frozenset(),
+        "get_financial_summary":     frozenset(),
+        "get_market_demand":         frozenset(),
+        "find_candidate":            frozenset({"developer_type"}),
+        "interview_candidate":       frozenset({"candidate_id"}),
+        "hire_candidate":            frozenset({"candidate_id"}),
+        "negotiate_salary":          frozenset({"candidate_id", "offer_weekly"}),
+        "match_candidate_to_project":frozenset({"candidate_id", "project_id", "role_id"}),
+        "let_go_candidate":          frozenset({"candidate_id"}),
+        "confirm_project":           frozenset({"project_id"}),
+        "pass_on_project":           frozenset({"project_id"}),
+        "request_project_extension": frozenset({"project_id"}),
+        "find_available_projects":   frozenset(),
+        "advance_week":              frozenset(),
+    }
+
     def __init__(self, config: Config | None = None):
         self._config = config or Config(
             llm_mode=os.getenv("LLM_MODE", "stub"),
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
         )
-        self._llm = LLMRouter(self._config)
-        from env.core import StaffingCore
-        self.core = StaffingCore(self._config, self._llm, env_type="mcp")
+        logger.info(
+            "[env.__init__] Creating environment  llm_mode=%s  stage=%s  capital=$%s  steps=%s",
+            self._config.llm_mode, self._config.curriculum_stage,
+            f"{self._config.seed_capital:,.0f}", self._config.episode_steps,
+        )
+        try:
+            self._llm = LLMRouter(self._config)
+            from env.core import StaffingCore
+            self.core = StaffingCore(self._config, self._llm, env_type="mcp")
+        except Exception:
+            logger.exception("[env.__init__] FAILED to init StaffingCore/LLMRouter")
+            raise
+
         self._state = StaffingState()
         self._passive_streak: int = 0   # consecutive GET-only turns this episode
         self._last_tool: str = ""        # last tool called, for repeat detection
@@ -82,16 +118,26 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         import random
         self._rng = random.Random()
 
-        mcp = FastMCP("staffing_agency")
-        self._register_tools(mcp)
-        super().__init__(mcp)
+        try:
+            mcp = FastMCP("staffing_agency")
+            self._register_tools(mcp)
+            super().__init__(mcp)
+            logger.info("[env.__init__] Tools registered — environment ready")
+        except Exception:
+            logger.exception("[env.__init__] FAILED during tool registration or super().__init__")
+            raise
 
     # ------------------------------------------------------------------
     # OpenEnv required interface
     # ------------------------------------------------------------------
 
     def reset(self, seed: int | None = None, episode_id: str | None = None, **kwargs) -> StaffingObservation:
-        self.core.reset(seed)
+        logger.info("[env.reset] seed=%s  episode_id=%s", seed, episode_id)
+        try:
+            self.core.reset(seed)
+        except Exception:
+            logger.exception("[env.reset] StaffingCore.reset() FAILED  seed=%s", seed)
+            raise
         self._passive_streak = 0
         self._last_tool = ""
         self._last_tool_reward = 0.0
@@ -147,6 +193,20 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         # Reset per-step reward accumulator before the tool runs
         self._last_tool_reward = 0.0
 
+        # Strip hallucinated args the LLM adds to tools that don't accept them.
+        # FastMCP uses Pydantic strict validation — any unexpected kwarg raises
+        # ValidationError which bypasses _last_tool_reward and gives reward=0.
+        tool_name_for_strip = getattr(action, "tool_name", "")
+        if tool_name_for_strip in self._TOOL_VALID_ARGS and hasattr(action, "arguments"):
+            valid = self._TOOL_VALID_ARGS[tool_name_for_strip]
+            bad = {k for k in action.arguments if k not in valid}
+            if bad:
+                logger.warning(
+                    "[env.step] Stripping hallucinated args from %s: %s",
+                    tool_name_for_strip, sorted(bad),
+                )
+                action.arguments = {k: v for k, v in action.arguments.items() if k in valid}
+
         # Let MCPEnvironment route and execute the tool call
         obs = super().step(action, timeout_s=timeout_s, **kwargs)
 
@@ -194,6 +254,21 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         self._state.num_benched = sum(1 for c in self.core.candidates.values() if c.status == "hired")
         active = [cl for cl in self.core.clients if not cl.churn_risk]
         self._state.avg_satisfaction = sum(cl.satisfaction_score for cl in active) / len(active) if active else 0.0
+
+        logger.debug(
+            "[env.step] tool=%s  tool_rew=%+.2f  passive=%+.2f  repeat=%+.2f  "
+            "total=%+.2f  cash=$%s  profit=$%s  done=%s",
+            tool_name, tool_reward, passive_penalty, repeat_penalty, total_reward,
+            f"{self._state.cash:,.0f}",
+            f"{self._state.revenue - self._state.costs:,.0f}",
+            done,
+        )
+        if done:
+            logger.warning(
+                "[env.step] Episode DONE  reason=%s  cash=$%s  step=%s",
+                "bankrupt" if self._state.cash < 0 else "max_steps",
+                f"{self._state.cash:,.0f}", self._state.step_count,
+            )
 
         # Unwrap CallToolObservation → plain dict (strip reward key so agent never sees it)
         tool_result = None
@@ -283,7 +358,8 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             return dict(res["candidate"])
 
         @mcp.tool()
-        def get_market_demand() -> dict:
+        def get_market_demand(sector: str = "", developer_type: str = "") -> dict:
+            """See which developer roles are currently most requested by clients."""
             r = env.core.tool_get_market_demand()
             return {"demand_by_type": r["demand_by_type"], "total_open_slots": r["total_open_slots"]}
 
@@ -296,7 +372,6 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         @mcp.tool()
         def find_available_projects() -> dict:
             r = env.core.tool_find_available_projects()
-            # reward=0 for pure read
             return {"projects": r["projects"], "count": r["count"]}
 
         @mcp.tool()

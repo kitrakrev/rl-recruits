@@ -30,7 +30,8 @@ from fastapi import Body, HTTPException
 from openenv.core.env_server.http_server import create_app
 from openenv.core.env_server.mcp_types import CallToolAction, CallToolObservation
 
-from env.config import Config, TrainingConfig
+from env.config import Config
+from training.config import TrainingConfig
 from server.staffing_environment import StaffingAgencyEnvironment
 
 # ---------------------------------------------------------------------------
