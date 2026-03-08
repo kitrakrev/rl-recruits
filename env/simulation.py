@@ -1,8 +1,9 @@
+from __future__ import annotations
+import asyncio
 """
 Simulation logic — stochastic world dynamics that run each step.
 Handles: project arrivals, deadlines, candidate patience, contracts, churn.
 """
-from __future__ import annotations
 import random
 import uuid
 from typing import TYPE_CHECKING
@@ -168,6 +169,39 @@ def tick_project_deadlines(
         client.projects = still_active
     return expired
 
+async def async_tick_project_deadlines(
+    clients: list[Client],
+    llm: "LLMRouter",
+) -> list[tuple[Project, Client]]:
+
+    expired = []
+    tasks = []
+    for client in clients:
+        still_active = []
+        for project in client.projects:
+            if project.fill_status == "SEALED":
+                still_active.append(project)
+                continue
+            project.deadline_remaining -= 1
+            if project.deadline_remaining <= 0:
+                expired.append((project, client))
+                client.num_projects_expired += 1
+                # Prepare LLM call
+                event = {"type": "project_expired", "project_id": project.project_id}
+                tasks.append((client, event, llm.async_client_satisfaction(client, event, client.event_history)))
+            else:
+                still_active.append(project)
+        client.projects = still_active
+
+    if tasks:
+        import asyncio
+        results = await asyncio.gather(*(t[2] for t in tasks))
+        for (client, event, _), result in zip(tasks, results):
+            client.satisfaction_score = result.new_score
+            client.churn_risk = result.churn_risk
+            client.event_history.append(event)
+    return expired
+
 
 def tick_candidate_patience(
     candidates: list[Candidate],
@@ -180,13 +214,37 @@ def tick_candidate_patience(
         if c.status not in ("hired",):
             continue  # only benched (hired but not placed) candidates age
         c.weeks_on_bench += 1
+        c.patience_remaining -= 1
+
         if c.patience_remaining <= 2:
             result = llm.candidate_leave(c, agency_context)
-            c.patience_remaining = result.patience_remaining
-            if result.leaves:
+            if result.leave:
                 leavers.append(c)
-        else:
-            c.patience_remaining -= 1
+    return leavers
+
+async def async_tick_candidate_patience(
+    candidates: list[Candidate],
+    llm: "LLMRouter",
+    agency_context: dict,
+) -> list[Candidate]:
+    leavers = []
+    tasks = []
+    
+    for c in candidates:
+        if c.status not in ("hired",):
+            continue
+        c.weeks_on_bench += 1
+        c.patience_remaining -= 1
+
+        if c.patience_remaining <= 2:
+            tasks.append((c, llm.async_candidate_leave(c, agency_context)))
+
+    if tasks:
+        results = await asyncio.gather(*(t[1] for t in tasks))
+        for (c, _), result in zip(tasks, results):
+            if result.leave:
+                leavers.append(c)
+
     return leavers
 
 

@@ -13,6 +13,8 @@ class Config:
     episode_steps: int = 52          # 1 simulated business year
     seed_capital: float = 50_000.0
     reward_scale: float = 1_000.0    # divide raw $ reward by this for stability
+    target_profit: float = 200_000.0
+    win_bonus: float = 50_000.0
 
     # --- Curriculum stage ---
     curriculum_stage: Literal[1, 2, 3] = 3
