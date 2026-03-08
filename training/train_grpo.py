@@ -805,78 +805,90 @@ def train_grpo(args):
     """Full GRPO training loop using TRL."""
     try:
         from trl import GRPOTrainer, GRPOConfig
-        from trl.experimental.openenv import generate_rollout_completions
         from transformers import AutoTokenizer, AutoModelForCausalLM
         import torch
-    except ImportError:
-        print("[!] TRL/transformers not installed. Run with --dry_run or:")
-        print("    uv pip install -e '.[train]'")
+        import requests as _req
+    except ImportError as e:
+        print(f"[!] Missing dependency: {e}")
+        print("    Run: uv pip install -e '.[train]'")
         sys.exit(1)
 
     from client import StaffingAgencyEnv
+    from datasets import Dataset
 
+    # -----------------------------------------------------------------------
+    # Env helpers — use sync HTTP directly (same as dry_run)
+    # -----------------------------------------------------------------------
+    _env_state = {"reward": 0.0}  # shared state for reward fn
+
+    def _http_step(tool_name: str, params: dict) -> float:
+        """Execute one tool call and return env reward."""
+        try:
+            with StaffingAgencyEnv(base_url=args.env_url) as _env:
+                from models import StaffingAction
+                result = _env.step(StaffingAction(tool=tool_name, params=params))
+                return float(result.reward or 0.0)
+        except Exception as e:
+            print(f"[!] env step error: {e}")
+            return -0.1
+
+    def _http_reset() -> str:
+        """Reset env and return initial observation text."""
+        try:
+            resp = _req.post(f"{args.env_url}/reset", json={"seed": args.seed}, timeout=10)
+            data = resp.json()
+            obs = data.get("observation", {})
+            if isinstance(obs, dict):
+                return obs.get("message", str(obs))
+            return str(data)
+        except Exception as e:
+            return f"Episode started. (reset error: {e})"
+
+    # -----------------------------------------------------------------------
+    # Reward function — executes tool in env, returns reward
+    # -----------------------------------------------------------------------
+    def reward_fn_profit(completions: list[str], **kwargs) -> list[float]:
+        """Primary reward: run the tool call against the live env."""
+        rewards = []
+        for c in completions:
+            parsed = parse_tool_call(c)
+            if parsed:
+                tool_name, params = parsed
+                rewards.append(_http_step(tool_name, params))
+            else:
+                rewards.append(-0.1)
+        return rewards
+
+    # -----------------------------------------------------------------------
+    # Dataset — varied initial state prompts
+    # -----------------------------------------------------------------------
     print(f"Loading model: {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
-    env_client = StaffingAgencyEnv(base_url=args.env_url)
+    initial_obs = _http_reset()
 
-    def rollout_func(prompts: list[str], trainer: GRPOTrainer):
-        """OpenEnv rollout function for GRPOTrainer."""
-        outputs = generate_rollout_completions(trainer, prompts)
-        tok = trainer.processing_class
-
-        env_rewards = []
-        format_rewards = []
-
-        for out in outputs:
-            completion_text = tok.decode(out["completion_ids"], skip_special_tokens=True)
-            parsed = parse_tool_call(completion_text)
-            fmt_r = reward_fn_tool_format([completion_text])[0]
-            format_rewards.append(fmt_r)
-
-            if parsed:
-                tool_name, params = parsed
-                try:
-                    from openenv.core.env_server.mcp_types import CallToolAction
-                    result = env_client.step(CallToolAction(tool_name=tool_name, arguments=params))
-                    env_rewards.append(float(result.reward or 0.0) + fmt_r)
-                except Exception:
-                    env_rewards.append(fmt_r - 0.1)
-            else:
-                env_rewards.append(fmt_r)
-
-        return {
-            "prompt_ids": [o["prompt_ids"] for o in outputs],
-            "completion_ids": [o["completion_ids"] for o in outputs],
-            "logprobs": [o["logprobs"] for o in outputs],
-            "env_reward": env_rewards,
-        }
-
-    # Reset env at episode boundaries
-    env_client.reset(seed=args.seed)
-
-    # Build dataset (system + initial observation prompts)
-    from datasets import Dataset
-    obs = env_client.reset(seed=args.seed)
-    initial_state = str(obs)
+    def _make_prompt(obs_text: str) -> str:
+        return tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"Current state:\n{obs_text}\nWhat is your action?"},
+            ],
+            tokenize=False, add_generation_prompt=True,
+        )
 
     dataset = Dataset.from_dict({
-        "prompt": [
-            tokenizer.apply_chat_template(
-                [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Current state:\n{initial_state}\nWhat is your action?"},
-                ],
-                tokenize=False, add_generation_prompt=True,
-            )
-        ] * args.num_episodes
+        "prompt": [_make_prompt(initial_obs)] * args.num_episodes
     })
 
+    # -----------------------------------------------------------------------
+    # Training config
+    # -----------------------------------------------------------------------
     training_args = GRPOConfig(
         output_dir=args.output_dir,
         num_train_epochs=1,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
+        num_generations=4,          # must divide generation_batch_size (1×4=4)
         learning_rate=5e-6,
         max_completion_length=256,
         logging_steps=10,
@@ -890,13 +902,14 @@ def train_grpo(args):
         device_map="auto",
     )
 
+    # GRPOTrainer: reward_funcs is the only list of reward callables needed.
+    # Each function receives (completions: list[str], **kwargs) → list[float].
     trainer = GRPOTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
         processing_class=tokenizer,
         reward_funcs=[reward_fn_profit, reward_fn_tool_format, reward_fn_placement],
-        rollout_function=rollout_func,
     )
 
     print(f"\nStarting GRPO training: {args.num_episodes} episodes")
