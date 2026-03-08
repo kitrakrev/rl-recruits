@@ -19,39 +19,11 @@ from typing import Any
 from fastmcp import FastMCP
 from openenv.core.env_server.mcp_environment import MCPEnvironment
 from openenv.core.env_server.mcp_types import ListToolsAction, CallToolAction, CallToolObservation
-from openenv.core.env_server.types import Observation, State
+from openenv.core.env_server.types import Observation
 
 from env.config import Config
-from env.models import Candidate, Role, Project, Client
 from env.llm import LLMRouter
-from env.simulation import (
-    generate_client,
-    replenish_market,
-    tick_project_arrivals,
-    tick_project_deadlines,
-    tick_candidate_patience,
-    tick_contracts,
-    compute_match_score,
-)
-
-
-# ---------------------------------------------------------------------------
-# Environment State (Pydantic, persisted across steps)
-# ---------------------------------------------------------------------------
-
-class StaffingState(State):
-    """Full serialisable state — returned from GET /state."""
-    episode_id: str = ""
-    step_count: int = 0
-    cash: float = 50_000.0
-    revenue: float = 0.0
-    costs: float = 0.0
-    num_placed: int = 0
-    num_hired: int = 0
-    num_benched: int = 0
-    avg_satisfaction: float = 0.75
-    cumulative_reward: float = 0.0
-    done: bool = False
+from models import StaffingState, StaffingObservation
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +46,16 @@ class StaffingAgencyEnvironment(MCPEnvironment):
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = False
 
+    # GET-only tools that produce zero world progress
+    _PASSIVE_TOOLS = frozenset({
+        "get_agency_state", "get_client_state", "get_candidate_state",
+        "get_project_details", "get_candidate_profile",
+        "get_market_demand", "get_financial_summary",
+    })
+    _PASSIVE_STREAK_PENALTY = -50.0   # $ per consecutive passive-only turn above threshold
+    _PASSIVE_STREAK_THRESHOLD = 3     # free passive turns before penalty kicks in
+    _REPEAT_CALL_PENALTY = -100.0     # penalty for calling the exact same tool twice in a row
+
     def __init__(self, config: Config | None = None):
         self._config = config or Config(
             llm_mode=os.getenv("LLM_MODE", "stub"),
@@ -83,6 +65,8 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         from env.core import StaffingCore
         self.core = StaffingCore(self._config, self._llm, env_type="mcp")
         self._state = StaffingState()
+        self._passive_streak: int = 0   # consecutive GET-only turns this episode
+        self._last_tool: str = ""        # last tool called, for repeat detection
 
         import random
         self._rng = random.Random()
@@ -95,8 +79,10 @@ class StaffingAgencyEnvironment(MCPEnvironment):
     # OpenEnv required interface
     # ------------------------------------------------------------------
 
-    def reset(self, seed: int | None = None, episode_id: str | None = None, **kwargs) -> Observation:
+    def reset(self, seed: int | None = None, episode_id: str | None = None, **kwargs) -> StaffingObservation:
         self.core.reset(seed)
+        self._passive_streak = 0
+        self._last_tool = ""
         episode_id = episode_id or str(uuid4())
         self._state = StaffingState(
             episode_id=episode_id,
@@ -106,17 +92,17 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             costs=0.0,
             done=False,
         )
-        return Observation(
-            done=False, reward=0.0,
-            metadata={
-                "episode_id": episode_id,
-                "message": (
-                    "Welcome to Staffing Agency RL. You are the agency CEO. "
-                    "Recruit candidates, fill client projects, maximise profit over 52 weeks. "
-                    "Use list_tools() to see all available actions."
-                ),
-                "state": self._snapshot(),
-            },
+        snap = self._snapshot()
+        
+        return StaffingObservation(
+            done=False,
+            reward=0.0,
+            step=snap["step"],
+            cash=snap["cash"],
+            profit=snap["profit"],
+            cumulative_reward=0.0,
+            tool_result={"message": "Environment reset. Current week: 1"},
+            message="Welcome to Staffing Agency RL. Environment reset."
         )
 
     # GET tools are read-only — no world tick, no step increment
@@ -139,43 +125,45 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         if isinstance(action, ListToolsAction):
             return super().step(action, timeout_s=timeout_s, **kwargs)
 
-        # GET tools: read-only, no tick, no step count increment
-        if isinstance(action, CallToolAction) and action.tool_name in self._GET_TOOLS:
-            obs = super().step(action, timeout_s=timeout_s, **kwargs)
-            tool_result = None
-            if hasattr(obs, "result") and obs.result is not None:
-                r = obs.result
-                tool_result = r.data if hasattr(r, "data") else r
-            return CallToolObservation(
-                tool_name=action.tool_name,
-                result={
-                    "_ctx": {
-                        "step": self._state.step_count,
-                        "cash": round(self._state.cash, 2),
-                        "profit": round(self._state.revenue - self._state.costs, 2),
-                        "cumulative_reward": round(self._state.cumulative_reward, 4),
-                    },
-                    "tool_result": tool_result,
-                },
-                done=self._state.done,
-                reward=0.0,
-            )
-
-        self.core.step_count += 1
-        self._state.step_count = self.core.step_count
+        # EXECUTE CallToolAction → No longer automatically ticks world.
+        # Step increment and world_tick are now handled by 'advance_week' tool.
+        pass
 
         # Let MCPEnvironment route EXECUTE CallToolAction
         obs = super().step(action, timeout_s=timeout_s, **kwargs)
 
-        # World tick: advance time, compute P&L reward
-        step_reward = self.core.world_tick()
-        total_reward = (obs.reward or 0.0) + step_reward / self._config.reward_scale
-
-        self._state.cumulative_reward += total_reward
-
+        # Sync state with core after action (tool might have changed cash/etc)
+        self._state.step_count = self.core.step_count
         self._state.cash = self.core.cash
         self._state.revenue = self.core.revenue
         self._state.costs = self.core.costs
+        
+        # Repeat-call penalty: penalize calling the same tool twice in a row
+        tool_name = action.tool_name if hasattr(action, "tool_name") else ""
+        repeat_penalty = 0.0
+        if tool_name and tool_name == self._last_tool:
+            repeat_penalty = self._REPEAT_CALL_PENALTY
+            self.core.costs += abs(repeat_penalty)
+        self._last_tool = tool_name
+
+        # Passive-streak penalty: discourage consecutive GET-only turns
+        if tool_name in self._PASSIVE_TOOLS:
+            self._passive_streak += 1
+        else:
+            self._passive_streak = 0  # reset on any active action
+
+        passive_penalty = 0.0
+        if self._passive_streak > self._PASSIVE_STREAK_THRESHOLD:
+            passive_penalty = self._PASSIVE_STREAK_PENALTY
+            self.core.costs += abs(passive_penalty)  # reflect in financials
+
+        # Re-sync costs after penalties (penalties mutate core.costs above)
+        self._state.costs = self.core.costs
+
+        # Reward is now primarily tool-based OR tick-based (if tool was advance_week)
+        total_reward = (obs.reward or 0.0) + passive_penalty + repeat_penalty
+        self._state.cumulative_reward += total_reward
+        
         done = (
             self._state.cash < 0
             or self._state.step_count >= self._config.episode_steps
@@ -188,12 +176,11 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         self._state.avg_satisfaction = sum(cl.satisfaction_score for cl in active) / len(active) if active else 0.0
 
         # Unwrap CallToolObservation → plain dict
-        # FastMCP returns CallToolResult; the parsed dict is in .data
         tool_result = None
         if hasattr(obs, "result") and obs.result is not None:
             r = obs.result
             if hasattr(r, "data"):
-                tool_result = r.data          # structured dict
+                tool_result = r.data
             elif hasattr(r, "structured_content"):
                 tool_result = r.structured_content
             else:
@@ -329,6 +316,11 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             res = env.core.tool_pass_on_project(project_id)
             if "reward" in res: res.pop("reward")
             return res
+
+        @mcp.tool()
+        def advance_week() -> dict:
+            """Advance simulation to the next week (ticks world, pays costs/revenue)."""
+            return env.core.tool_advance_week()
 
         @mcp.tool()
         def _override_cash(amount: float) -> dict:

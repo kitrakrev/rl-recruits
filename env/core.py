@@ -850,6 +850,32 @@ class StaffingCore:
             client.projects = [p for p in client.projects if p.project_id != project_id]
         return {"success": True, "reward": 0.0, "project_id": project_id, "passed": True}
 
+    def tool_advance_week(self) -> dict:
+        """Manually advance the simulation by one week (tick)."""
+        self.step_count += 1
+        reward = self.world_tick()
+        summary = self.tool_get_financial_summary()["summary"]
+        return {
+            "success": True,
+            "reward": reward,
+            "message": f"Advanced to week {self.step_count}. P&L for last week: ${reward:,.2f}",
+            "financial_summary": summary,
+            "step": self.step_count,
+        }
+
+    async def async_tool_advance_week(self) -> dict:
+        """Manually advance the simulation by one week (tick) - async version."""
+        self.step_count += 1
+        reward = await self.async_world_tick()
+        summary = self.tool_get_financial_summary()["summary"]
+        return {
+            "success": True,
+            "reward": reward,
+            "message": f"Advanced to week {self.step_count}. P&L for last week: ${reward:,.2f}",
+            "financial_summary": summary,
+            "step": self.step_count,
+        }
+
     # --- Helpers ---
 
     async def async_tool_pass_on_project(self, project_id: str) -> dict:

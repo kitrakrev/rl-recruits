@@ -89,23 +89,44 @@ class StaffingAgencyEnv(EnvClient[StaffingAction, StaffingObservation, StaffingS
           }
         """
         obs_dict    = payload.get("observation", {})
-        result_wrap = obs_dict.get("result") or {}
-        ctx         = result_wrap.get("_ctx", {}) if isinstance(result_wrap, dict) else {}
-        tool_result = result_wrap.get("tool_result") if isinstance(result_wrap, dict) else result_wrap
+        
+        # 1. Try to find nested result (from CallToolObservation)
+        result_wrap = obs_dict.get("result") or obs_dict.get("metadata", {}).get("result")
+        
+        if isinstance(result_wrap, dict):
+            ctx         = result_wrap.get("_ctx", {})
+            tool_result = result_wrap.get("tool_result")
+        else:
+            ctx         = {}
+            tool_result = result_wrap
+            
+        # 2. Fallback to top-level fields (from direct StaffingObservation or _ctx)
+        # Priority: explicit ctx > top-level obs_dict
+        step        = ctx.get("step")   if ctx.get("step") is not None   else obs_dict.get("step", 0)
+        cash        = ctx.get("cash")   if ctx.get("cash") is not None   else obs_dict.get("cash", 0.0)
+        profit      = ctx.get("profit") if ctx.get("profit") is not None else obs_dict.get("profit", 0.0)
+        cum_reward  = ctx.get("cumulative_reward") if ctx.get("cumulative_reward") is not None else obs_dict.get("cumulative_reward", 0.0)
+        
+        # If tool_result is still none, maybe it's the obs_dict itself (if it's not a structured model)
+        # or maybe there's a 'tool_result' field in obs_dict
+        if tool_result is None:
+            tool_result = obs_dict.get("tool_result")
+            
+        message     = obs_dict.get("message", "")
         reward      = payload.get("reward", 0.0)
         done        = payload.get("done", False)
 
         obs = StaffingObservation(
-            done=done,
-            reward=reward,
-            step=ctx.get("step", 0),
-            cash=ctx.get("cash", 0.0),
-            profit=ctx.get("profit", 0.0),
-            cumulative_reward=ctx.get("cumulative_reward", 0.0),
+            step=int(step),
+            cash=float(cash),
+            profit=float(profit),
+            cumulative_reward=float(cum_reward),
             tool_result=tool_result,
-            message=obs_dict.get("error") or "",
+            message=str(message),
+            reward=float(reward if reward is not None else 0.0),
+            done=bool(done)
         )
-        return StepResult(observation=obs, reward=reward, done=done)
+        return StepResult(observation=obs, reward=obs.reward, done=obs.done)
 
     def _parse_state(self, payload: dict) -> StaffingState:
         """Deserialise /state response → StaffingState."""

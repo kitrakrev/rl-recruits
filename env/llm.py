@@ -76,19 +76,19 @@ class LeaveDecision:
 def _get_client():
     if OpenAI is None:
         raise ImportError("openai package not installed. Run: uv pip install openai")
-    # Points to local vLLM server by default (port 8001)
-    base_url = os.getenv("OPENAI_API_BASE", "http://localhost:8001/v1")
-    return OpenAI(base_url=base_url, api_key="sk-local-dev")
+    # Points to local Ollama server by default (port 11434)
+    base_url = os.getenv("OPENAI_API_BASE", "http://localhost:11434/v1")
+    return OpenAI(base_url=base_url, api_key="ollama")
 
 def _get_async_client():
     if AsyncOpenAI is None:
         raise ImportError("openai package not installed. Run: uv pip install openai")
-    base_url = os.getenv("OPENAI_API_BASE", "http://localhost:8001/v1")
-    return AsyncOpenAI(base_url=base_url, api_key="sk-local-dev")
+    base_url = os.getenv("OPENAI_API_BASE", "http://localhost:11434/v1")
+    return AsyncOpenAI(base_url=base_url, api_key="ollama")
 
 def _get_model_name():
-    # Use whatever model is loaded in vLLM, or override with env var
-    return os.getenv("OPENAI_MODEL_NAME", "Qwen/Qwen2.5-32B-Instruct-AWQ")
+    # Use qwen2.5-coder:7b for the environment
+    return os.getenv("OPENAI_MODEL_NAME", "qwen2.5-coder:7b")
 
 def _call_llm_json(system_prompt: str, user_prompt: str) -> dict:
     """Helper to call local LLM and return parsed JSON."""

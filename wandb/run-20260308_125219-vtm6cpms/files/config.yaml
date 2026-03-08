@@ -1,0 +1,79 @@
+_wandb:
+    value:
+        cli_version: 0.25.0
+        e:
+            cxluu9wfhhc1dl4k2ei7hgzx1jrxvyat:
+                args:
+                    - --env_url
+                    - http://localhost:8000/
+                    - --num_episodes
+                    - "10"
+                    - --output_dir
+                    - training/checkpoints
+                    - --wandb_api_key
+                    - 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
+                    - --wandb_project
+                    - kanandan-university-of-california/Staffing_agent
+                codePath: training/train_grpo.py
+                codePathLocal: training/train_grpo.py
+                cpu_count: 64
+                cpu_count_logical: 128
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "30723257925632"
+                        used: "762024439808"
+                email: kanandan@ucsc.edu
+                executable: /root/rl-recruits/.venv/bin/python3
+                git:
+                    commit: 487438abd3b6c74734597d46044f367891891c2b
+                    remote: git@github.com:kitrakrev/rl-recruits.git
+                gpu: NVIDIA H100 80GB HBM3
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-133f8e77-0386-d881-9f3d-b6ad3ce1ca71
+                host: ubuntu-7c8759647-669br
+                memory:
+                    total: "2162529890304"
+                os: Linux-6.8.12-680-6063-coreweave-amd64-f81899c8-x86_64-with-glibc2.35
+                program: /root/rl-recruits/training/train_grpo.py
+                python: CPython 3.11.13
+                root: /root/rl-recruits
+                startedAt: "2026-03-08T12:52:19.496127Z"
+                writerId: cxluu9wfhhc1dl4k2ei7hgzx1jrxvyat
+        m: []
+        python_version: 3.11.13
+        t:
+            "1":
+                - 1
+                - 11
+                - 49
+                - 51
+                - 71
+                - 84
+            "2":
+                - 1
+                - 11
+                - 49
+                - 51
+                - 71
+                - 84
+            "3":
+                - 16
+            "4": 3.11.13
+            "5": 0.25.0
+            "6": 5.3.0
+            "12": 0.25.0
+            "13": linux-x86_64
+episodes:
+    value: 10
+max_turns:
+    value: 10
+model:
+    value: Qwen/Qwen3.5-4B
+seed:
+    value: 42
