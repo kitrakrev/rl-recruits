@@ -125,12 +125,19 @@ def health_check() -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _unwrap(r: dict) -> dict:
-    """Extract tool_result from HTTP step response."""
+    """Extract tool_result from HTTP step response.
+
+    Server now returns CallToolObservation with result = {"_ctx": {...}, "tool_result": {...}}.
+    """
     if isinstance(r, dict):
         obs = r.get("observation", {})
-        meta = obs.get("metadata", {}) if isinstance(obs, dict) else {}
-        tr = meta.get("tool_result", {})
-        return tr if tr else r
+        if isinstance(obs, dict):
+            result_wrap = obs.get("result") or {}
+            if isinstance(result_wrap, dict):
+                tr = result_wrap.get("tool_result")
+                if tr:
+                    return tr
+        return r
     return {}
 
 
@@ -149,7 +156,12 @@ def fetch_full_state() -> dict:
     state["clients"] = _unwrap(clients)
     state["demand"]  = _unwrap(demand)
     state["finance"] = _unwrap(finance)
-    state["step"]    = state["agency"].get("step", 0)
+
+    # Also grab _ctx from the agency response for step/cash/profit
+    agency_obs = agency.get("observation", {}) if isinstance(agency, dict) else {}
+    agency_wrap = agency_obs.get("result", {}) if isinstance(agency_obs, dict) else {}
+    state["_ctx"] = agency_wrap.get("_ctx", {}) if isinstance(agency_wrap, dict) else {}
+    state["step"] = state["_ctx"].get("step", state["agency"].get("step", 0))
 
     # Append to history
     a = state["agency"]
@@ -712,10 +724,11 @@ def manual_tool_call(tool_name: str, params_json: str) -> tuple[str, str]:
     result = call_tool(tool_name, params)
 
     obs = result.get("observation", {})
-    meta = obs.get("metadata", {}) if isinstance(obs, dict) else {}
-    reward = meta.get("reward") or result.get("reward", 0.0)
-    tr = meta.get("tool_result", result)
-    step = meta.get("step", len(_agent_actions))
+    result_wrap = obs.get("result", {}) if isinstance(obs, dict) else {}
+    ctx = result_wrap.get("_ctx", {}) if isinstance(result_wrap, dict) else {}
+    tr = result_wrap.get("tool_result", result_wrap) if isinstance(result_wrap, dict) else result_wrap
+    reward = result.get("reward", 0.0)
+    step = ctx.get("step", len(_agent_actions))
 
     success = not (isinstance(tr, dict) and "error" in tr)
     snippet = str(tr)[:120] if tr else ""

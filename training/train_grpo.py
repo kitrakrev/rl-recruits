@@ -224,35 +224,38 @@ def reward_fn_placement(completions: list[str], **kwargs) -> list[float]:
 
 def dry_run_simulate(env_url: str, num_episodes: int, max_turns: int, seed: int):
     """
-    Simulate training without a model. Uses a heuristic 'greedy' policy
-    to demonstrate reward curves and validate the full pipeline.
+    Simulate training without a model. Uses heuristic policies to demonstrate
+    reward curves and validate the FULL HTTP stack (server → MCP tools → env).
+
+    Hits the live server at env_url — make sure it's running:
+        uvicorn server.app:app --host 0.0.0.0 --port 8000
     """
     import random
-    import time
+    import requests as _req
 
     print("\n" + "="*60)
-    print("DRY RUN MODE — Simulating reward curves without LLM")
+    print("DRY RUN MODE — Simulating reward curves via live server")
+    print(f"Server: {env_url}")
     print("="*60)
 
-    # Import env directly (no HTTP needed for dry run)
-    from env.config import Config
-    from server.staffing_environment import StaffingAgencyEnvironment
-    from openenv.core.env_server.mcp_types import CallToolAction, ListToolsAction
+    # Verify server is up
+    try:
+        _req.get(f"{env_url}/health", timeout=5).raise_for_status()
+        print("[✓] Server is healthy")
+    except Exception as e:
+        print(f"[✗] Server not reachable at {env_url}: {e}")
+        print("    Start it with: uvicorn server.app:app --host 0.0.0.0 --port 8000")
+        sys.exit(1)
 
-    cfg = Config(llm_mode="stub", curriculum_stage=2)
-    env = StaffingAgencyEnvironment(cfg)
-
-    episode_rewards = []
-    episode_profits = []
-    episode_placements = []
+    from models import StaffingAction
+    from client import StaffingAgencyEnv
 
     rng = random.Random(seed)
 
-    # 3 policies for before/after comparison
     policies = {
-        "random": _policy_random,
-        "greedy": _policy_greedy,
-        "optimal_heuristic": _policy_optimal,
+        "random":            _policy_random_http,
+        "greedy":            _policy_greedy_http,
+        "optimal_heuristic": _policy_optimal_http,
     }
 
     results = {}
@@ -261,136 +264,175 @@ def dry_run_simulate(env_url: str, num_episodes: int, max_turns: int, seed: int)
         rewards_per_episode = []
         profits_per_episode = []
 
-        n = num_episodes // len(policies)
-        for ep in range(n):
-            ep_seed = rng.randint(0, 99999)
-            obs = env.reset(seed=ep_seed)
-            ep_reward = 0.0
+        n = max(1, num_episodes // len(policies))
 
-            for step in range(52):
-                action_name, params = policy_fn(env, rng)
+        with StaffingAgencyEnv(base_url=env_url) as env:
+            for ep in range(n):
+                ep_seed = rng.randint(0, 99999)
+                env.reset(seed=ep_seed)
+                ep_reward = 0.0
+                # Carry policy state across steps (for greedy/optimal)
+                policy_state: dict = {}
+
+                for _ in range(52):
+                    action = policy_fn(env, rng, policy_state)
+                    try:
+                        result = env.step(action)
+                        ep_reward += float(result.reward or 0.0)
+                        if result.done:
+                            break
+                    except Exception:
+                        pass
+
+                # Read final profit from server state
                 try:
-                    action = CallToolAction(tool_name=action_name, arguments=params)
-                    result = env.step(action)
-                    ep_reward += float(result.reward or 0.0)
-                    if result.done:
-                        break
-                except Exception as e:
-                    pass  # ignore tool errors in dry run
+                    fin = _req.post(
+                        f"{env_url}/step",
+                        json={"tool": "get_financial_summary", "params": {}},
+                        timeout=5,
+                    ).json()
+                    obs_meta = fin.get("observation", {}).get("metadata", {})
+                    tr = obs_meta.get("tool_result", {})
+                    final_profit = tr.get("profit", 0.0)
+                except Exception:
+                    final_profit = 0.0
 
-            final_profit = env._state.revenue - env._state.costs
-            rewards_per_episode.append(ep_reward)
-            profits_per_episode.append(final_profit)
+                rewards_per_episode.append(ep_reward)
+                profits_per_episode.append(final_profit)
 
-            if ep % 10 == 0:
-                print(f"  Episode {ep:3d}: reward={ep_reward:+8.3f}  profit=${final_profit:>10,.0f}")
+                if ep % max(1, n // 5) == 0:
+                    print(f"  Episode {ep:3d}: reward={ep_reward:+8.3f}  profit=${final_profit:>10,.0f}")
 
         results[policy_name] = {
             "rewards": rewards_per_episode,
             "profits": profits_per_episode,
         }
 
-    # Save reward curves
-    _plot_reward_curves(results, num_episodes // len(policies))
+    _plot_reward_curves(results, max(1, num_episodes // len(policies)))
     _save_metrics(results)
 
     print("\n[✓] Dry run complete. Reward curves saved to training/reward_curves.png")
     return results
 
 
-def _policy_random(env, rng):
-    """Random policy: pick random tool + random params."""
-    safe_tools = [
-        "get_agency_state", "get_candidate_state",
-        "find_available_projects", "get_financial_summary",
+# ---------------------------------------------------------------------------
+# HTTP-based policies (work against the live server via client.py)
+# ---------------------------------------------------------------------------
+
+def _call(env, tool: str, params: dict = {}):
+    """Helper: step the env with a StaffingAction, return tool_result dict."""
+    from models import StaffingAction
+    result = env.step(StaffingAction(tool=tool, params=params))
+    tr = result.observation.tool_result if hasattr(result.observation, "tool_result") else {}
+    return tr or {}, result
+
+
+def _policy_random_http(env, rng, state: dict):
+    from models import StaffingAction
+    tools = [
+        "find_available_projects", "get_agency_state",
+        "get_candidate_state", "get_financial_summary",
+        "find_candidate",
     ]
-    return rng.choice(safe_tools), {}
+    return StaffingAction(tool=rng.choice(tools), params={})
 
 
-def _policy_greedy(env, rng):
-    """Greedy policy: always try to interview → hire → place."""
-    from openenv.core.env_server.mcp_types import CallToolAction
+def _policy_greedy_http(env, rng, state: dict):
+    """Greedy: interview → hire → place. Reads state via GET tools each step."""
+    from models import StaffingAction
 
-    # Check if there are candidates in pipeline to hire
-    for c in env._candidates.values():
-        if c.status == "in_pipeline":
-            return "hire_candidate", {"candidate_id": c.id}
-    # Check if there are hired candidates to place
-    for c in env._candidates.values():
-        if c.status == "hired":
-            for client in env._clients:
-                for project in client.projects:
-                    for role in project.roles:
-                        if not role.is_filled and c.developer_type == role.developer_type:
-                            return "match_candidate_to_project", {
-                                "candidate_id": c.id,
-                                "project_id": project.project_id,
-                                "role_id": role.role_id,
-                            }
-    # Interview someone from market
-    if env._market:
-        c = env._market[0]
-        return "interview_candidate", {"candidate_id": c.id}
-    return "get_agency_state", {}
+    # Get candidate state
+    cands_tr, _ = _call(env, "get_candidate_state")
+    candidates = cands_tr.get("candidates", [])
+
+    # Hire anyone in pipeline
+    for c in candidates:
+        if c.get("status") == "in_pipeline":
+            return StaffingAction(tool="hire_candidate", params={"candidate_id": c["id"]})
+
+    # Place any hired candidate into a matching open role
+    for c in candidates:
+        if c.get("status") == "hired":
+            projs_tr, _ = _call(env, "find_available_projects")
+            for p in projs_tr.get("projects", []):
+                for r in p.get("roles", []):
+                    if not r.get("is_filled") and r.get("developer_type") == c.get("developer_type"):
+                        return StaffingAction(
+                            tool="match_candidate_to_project",
+                            params={
+                                "candidate_id": c["id"],
+                                "project_id": p["project_id"],
+                                "role_id": r["role_id"],
+                            },
+                        )
+
+    # Interview first market candidate
+    market_tr, _ = _call(env, "find_candidate")
+    market = market_tr.get("candidates", [])
+    if market:
+        return StaffingAction(tool="interview_candidate", params={"candidate_id": market[0]["id"]})
+
+    return StaffingAction(tool="get_agency_state", params={})
 
 
-def _policy_optimal(env, rng):
-    """
-    Optimal heuristic: demand-aware hiring with fast placement.
-    1. Check market demand
-    2. Only hire if matching open role exists
-    3. Place immediately after hiring
-    4. Pass on low-deadline projects when understaffed
-    """
-    # Compute demand
-    demand = {}
-    urgent_projects = []
-    for client in env._clients:
-        for project in client.projects:
-            for role in project.roles:
-                if not role.is_filled:
-                    demand[role.developer_type] = demand.get(role.developer_type, 0) + 1
-                    if project.deadline_remaining <= 3:
-                        urgent_projects.append((project, role, client))
+def _policy_optimal_http(env, rng, state: dict):
+    """Demand-aware: only hire types with open roles, place immediately, pass expiring projects."""
+    from models import StaffingAction
 
-    # Place any already-hired matching candidates first
-    for c in env._candidates.values():
-        if c.status == "hired":
-            for client in env._clients:
-                if client.churn_risk:
-                    continue
-                for project in client.projects:
-                    for role in project.roles:
-                        if not role.is_filled:
-                            from env.simulation import compute_match_score
-                            ms = compute_match_score(c, role, env._config)
-                            if ms > 0:
-                                return "match_candidate_to_project", {
-                                    "candidate_id": c.id,
-                                    "project_id": project.project_id,
-                                    "role_id": role.role_id,
-                                }
+    projs_tr, _ = _call(env, "find_available_projects")
+    projects = projs_tr.get("projects", [])
 
-    # Hire if demand exists
-    for c in env._candidates.values():
-        if c.status == "in_pipeline" and c.developer_type in demand:
-            return "hire_candidate", {"candidate_id": c.id}
+    # Build demand map and flag urgent projects
+    demand: dict[str, int] = {}
+    urgent_ids: list[str] = []
+    for p in projects:
+        for r in p.get("roles", []):
+            if not r.get("is_filled"):
+                dt = r.get("developer_type", "")
+                demand[dt] = demand.get(dt, 0) + 1
+        if p.get("deadline_remaining", 99) <= 3:
+            urgent_ids.append(p["project_id"])
 
-    # Interview from market matching demand
-    for c in env._market:
-        if c.developer_type in demand and demand[c.developer_type] > 0:
-            return "interview_candidate", {"candidate_id": c.id}
+    cands_tr, _ = _call(env, "get_candidate_state")
+    candidates = cands_tr.get("candidates", [])
 
-    # Pass on projects about to expire that we can't fill
-    for project, role, client in urgent_projects:
-        has_match = any(
-            c.status == "hired" and c.developer_type == role.developer_type
-            for c in env._candidates.values()
-        )
-        if not has_match:
-            return "pass_on_project", {"project_id": project.project_id}
+    # Place hired candidates into matching roles first
+    for c in candidates:
+        if c.get("status") == "hired":
+            for p in projects:
+                for r in p.get("roles", []):
+                    if not r.get("is_filled") and r.get("developer_type") == c.get("developer_type"):
+                        return StaffingAction(
+                            tool="match_candidate_to_project",
+                            params={
+                                "candidate_id": c["id"],
+                                "project_id": p["project_id"],
+                                "role_id": r["role_id"],
+                            },
+                        )
 
-    return "get_financial_summary", {}
+    # Hire pipeline candidates whose type is in demand
+    for c in candidates:
+        if c.get("status") == "in_pipeline" and c.get("developer_type") in demand:
+            return StaffingAction(tool="hire_candidate", params={"candidate_id": c["id"]})
+
+    # Interview market candidates matching demand
+    if demand:
+        for dt in demand:
+            market_tr, _ = _call(env, "find_candidate", {"developer_type": dt})
+            market = market_tr.get("candidates", [])
+            if market:
+                return StaffingAction(tool="interview_candidate", params={"candidate_id": market[0]["id"]})
+
+    # Pass on urgent projects we can't fill
+    hired_types = {c.get("developer_type") for c in candidates if c.get("status") == "hired"}
+    for p in projects:
+        if p["project_id"] in urgent_ids:
+            needs = {r.get("developer_type") for r in p.get("roles", []) if not r.get("is_filled")}
+            if not needs.intersection(hired_types):
+                return StaffingAction(tool="pass_on_project", params={"project_id": p["project_id"]})
+
+    return StaffingAction(tool="get_financial_summary", params={})
 
 
 def _plot_reward_curves(results: dict, n_episodes: int):

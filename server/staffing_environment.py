@@ -18,7 +18,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 from openenv.core.env_server.mcp_environment import MCPEnvironment
-from openenv.core.env_server.mcp_types import ListToolsAction, CallToolAction
+from openenv.core.env_server.mcp_types import ListToolsAction, CallToolAction, CallToolObservation
 from openenv.core.env_server.types import Observation, State
 
 from env.config import Config
@@ -173,16 +173,19 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             if hasattr(obs, "result") and obs.result is not None:
                 r = obs.result
                 tool_result = r.data if hasattr(r, "data") else r
-            return Observation(
-                done=self._state.done,
-                reward=0.0,
-                metadata={
-                    "step": self._state.step_count,
-                    "cash": round(self._state.cash, 2),
-                    "profit": round(self._state.revenue - self._state.costs, 2),
-                    "cumulative_reward": round(self._state.cumulative_reward, 4),
+            return CallToolObservation(
+                tool_name=action.tool_name,
+                result={
+                    "_ctx": {
+                        "step": self._state.step_count,
+                        "cash": round(self._state.cash, 2),
+                        "profit": round(self._state.revenue - self._state.costs, 2),
+                        "cumulative_reward": round(self._state.cumulative_reward, 4),
+                    },
                     "tool_result": tool_result,
                 },
+                done=self._state.done,
+                reward=0.0,
             )
 
         self._state.step_count += 1
@@ -229,16 +232,19 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         elif hasattr(obs, "metadata"):
             tool_result = obs.metadata
 
-        return Observation(
-            done=done,
-            reward=total_reward,
-            metadata={
-                "step": self._state.step_count,
-                "cash": round(self._state.cash, 2),
-                "profit": round(self._state.revenue - self._state.costs, 2),
-                "cumulative_reward": round(self._state.cumulative_reward, 4),
+        return CallToolObservation(
+            tool_name=action.tool_name,
+            result={
+                "_ctx": {
+                    "step": self._state.step_count,
+                    "cash": round(self._state.cash, 2),
+                    "profit": round(self._state.revenue - self._state.costs, 2),
+                    "cumulative_reward": round(self._state.cumulative_reward, 4),
+                },
                 "tool_result": tool_result,
             },
+            done=done,
+            reward=total_reward,
         )
 
     @property

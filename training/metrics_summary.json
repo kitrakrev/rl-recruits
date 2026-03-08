@@ -1,0 +1,23 @@
+{
+  "random": {
+    "mean_reward": -51.5585,
+    "mean_profit": -51558.49,
+    "max_profit": -2043.27,
+    "min_profit": -89903.85,
+    "positive_profit_rate": 0.0
+  },
+  "greedy": {
+    "mean_reward": -124.6386,
+    "mean_profit": -140038.62,
+    "max_profit": -88956.73,
+    "min_profit": -170711.54,
+    "positive_profit_rate": 0.0
+  },
+  "optimal_heuristic": {
+    "mean_reward": -59.0625,
+    "mean_profit": -70062.5,
+    "max_profit": 0.0,
+    "min_profit": -134384.62,
+    "positive_profit_rate": 0.0
+  }
+}

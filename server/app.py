@@ -15,7 +15,7 @@ from openenv.core.env_server.mcp_types import CallToolAction, CallToolObservatio
 from server.staffing_environment import StaffingAgencyEnvironment
 
 app = create_app(
-    env_cls=StaffingAgencyEnvironment,
+    env=StaffingAgencyEnvironment,
     action_cls=CallToolAction,
     observation_cls=CallToolObservation,
     env_name="staffing_agency",

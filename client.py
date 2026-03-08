@@ -66,29 +66,46 @@ class StaffingAgencyEnv(EnvClient[StaffingAction, StaffingObservation, StaffingS
     """
 
     def _step_payload(self, action: StaffingAction) -> dict:
-        """Serialise a StaffingAction → JSON dict sent over WebSocket."""
+        """Serialise a StaffingAction → CallToolAction dict sent over WebSocket."""
         return {
-            "tool":   action.tool,
-            "params": action.params,
+            "type":      "call_tool",
+            "tool_name": action.tool,
+            "arguments": action.params,
         }
 
     def _parse_result(self, payload: dict) -> StepResult[StaffingObservation]:
-        """Deserialise server response → StepResult[StaffingObservation]."""
+        """Deserialise server response → StepResult[StaffingObservation].
+
+        Server sends CallToolObservation serialized as:
+          {
+            "observation": {
+                "tool_name": ...,
+                "result": {"_ctx": {step, cash, profit, cumulative_reward},
+                           "tool_result": <tool-specific dict>},
+                "error": null,
+            },
+            "reward": float,
+            "done": bool,
+          }
+        """
+        obs_dict    = payload.get("observation", {})
+        result_wrap = obs_dict.get("result") or {}
+        ctx         = result_wrap.get("_ctx", {}) if isinstance(result_wrap, dict) else {}
+        tool_result = result_wrap.get("tool_result") if isinstance(result_wrap, dict) else result_wrap
+        reward      = payload.get("reward", 0.0)
+        done        = payload.get("done", False)
+
         obs = StaffingObservation(
-            done=payload.get("done", False),
-            reward=payload.get("reward", 0.0),
-            step=payload.get("step", 0),
-            cash=payload.get("cash", 0.0),
-            profit=payload.get("profit", 0.0),
-            cumulative_reward=payload.get("cumulative_reward", 0.0),
-            tool_result=payload.get("tool_result"),
-            message=payload.get("message", ""),
+            done=done,
+            reward=reward,
+            step=ctx.get("step", 0),
+            cash=ctx.get("cash", 0.0),
+            profit=ctx.get("profit", 0.0),
+            cumulative_reward=ctx.get("cumulative_reward", 0.0),
+            tool_result=tool_result,
+            message=obs_dict.get("error") or "",
         )
-        return StepResult(
-            observation=obs,
-            reward=obs.reward,
-            done=obs.done,
-        )
+        return StepResult(observation=obs, reward=reward, done=done)
 
     def _parse_state(self, payload: dict) -> StaffingState:
         """Deserialise /state response → StaffingState."""
