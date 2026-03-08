@@ -458,7 +458,8 @@ class StaffingCore:
     def tool_interview_candidate(self, candidate_id: str) -> dict:
         c = next((m for m in self.market if m.id == candidate_id), None)
         if not c:
-            return {"success": False, "error": f"Candidate {candidate_id} not in market", "reward": 0.0}
+            return {"success": False, "error": f"Candidate {candidate_id} not in market",
+                    "reward": -150.0}
         
         job_desc = f"{c.developer_type} {c.seniority_level}"
         if c.seniority_level != "junior":
@@ -541,9 +542,13 @@ class StaffingCore:
     def tool_hire_candidate(self, candidate_id: str) -> dict:
         c = self.candidates.get(candidate_id)
         if not c:
-            return {"success": False, "error": f"Candidate {candidate_id} not found", "reward": 0.0}
+            # Candidate not in self.candidates means they were never interviewed
+            # (still in market or ID was invented). Negative reward — wrong workflow.
+            return {"success": False, "error": f"Candidate {candidate_id} not found",
+                    "reward": -300.0}
         if c.status not in ("in_pipeline", "pending_hire"):
-            return {"success": False, "error": f"Cannot hire: status is '{c.status}'", "reward": 0.0}
+            return {"success": False, "error": f"Cannot hire: status is '{c.status}'",
+                    "reward": -300.0}
 
         self.cash -= self.config.onboarding_cost
         self.costs += self.config.onboarding_cost
@@ -619,25 +624,28 @@ class StaffingCore:
     def tool_match_candidate_to_project(self, candidate_id: str, project_id: str, role_id: str) -> dict:
         c = self.candidates.get(candidate_id)
         if not c or c.status != "hired":
-            return {"success": False, "error": "Candidate must be in 'hired' status / available", "reward": 0.0}
+            status = c.status if c else "not_in_roster"
+            return {"success": False,
+                    "error": f"Candidate must be in 'hired' status / available (current: {status})",
+                    "reward": -300.0}
 
         project = self.find_project(project_id)
         if not project:
-            return {"success": False, "error": f"Project {project_id} not found", "reward": 0.0}
+            return {"success": False, "error": f"Project {project_id} not found", "reward": -200.0}
 
         role = next((r for r in project.roles if r.role_id == role_id), None)
         if not role:
-            return {"success": False, "error": f"Role {role_id} not found", "reward": 0.0}
+            return {"success": False, "error": f"Role {role_id} not found", "reward": -200.0}
 
         if role.is_filled:
-            return {"success": False, "error": "Role is already fully filled", "reward": 0.0}
+            return {"success": False, "error": "Role is already fully filled", "reward": -100.0}
 
         match_score = compute_match_score(c, role, self.config)
         if match_score == 0.0:
             return {
                 "success": False,
                 "error": diagnose_match_failure(c, role, self.config),
-                "reward": 0.0,
+                "reward": -300.0,
                 "candidate_type": c.developer_type, "role_type": role.developer_type,
                 "candidate_skill": c.skill_score, "role_min_skill": role.min_skill_score,
             }
@@ -809,7 +817,8 @@ class StaffingCore:
     def tool_let_go_candidate(self, candidate_id: str) -> dict:
         c = self.candidates.get(candidate_id)
         if not c:
-            return {"success": False, "error": f"Candidate {candidate_id} not found", "reward": 0.0}
+            return {"success": False, "error": f"Candidate {candidate_id} not found",
+                    "reward": -200.0}
         severance = c.salary_weekly * self.config.severance_weeks
         self.cash -= severance
         self.costs += severance

@@ -42,11 +42,17 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Core
-    p.add_argument("--env_url",    default=None, help="Environment server URL")
-    p.add_argument("--model_name", default=None, help="HuggingFace model ID")
+    p.add_argument("--env_url",      default=None, help="Environment server URL")
+    p.add_argument("--model_name",   default=None, help="HuggingFace model ID")
     p.add_argument("--num_episodes", type=int, default=None, help="Training episodes")
-    p.add_argument("--output_dir", default=None, help="Where to save the fine-tuned model")
-    p.add_argument("--seed",       type=int, default=None)
+    p.add_argument("--output_dir",   default=None, help="Where to save the fine-tuned model")
+    p.add_argument("--seed",         type=int, default=None)
+
+    # Episode length / early-stop (env-side, patched via /config/env)
+    p.add_argument("--episode_weeks", type=int, default=None,
+                   help="Max weeks per episode (default 10). Shorter = faster backprop.")
+    p.add_argument("--max_loss",      type=float, default=None,
+                   help="End episode early when cash drops by this much (default $3000).")
 
     # Dry-run
     p.add_argument("--dry_run", action="store_true",
@@ -55,12 +61,14 @@ def parse_args() -> argparse.Namespace:
                    help="Tool calls per episode step (dry-run) or per week (training)")
 
     # Hyperparameters (all optional — defaults come from TrainingConfig)
-    p.add_argument("--learning_rate",     type=float, default=None)
-    p.add_argument("--gamma",             type=float, default=None, help="Discount factor")
-    p.add_argument("--kl_coeff",          type=float, default=None, help="KL penalty weight")
-    p.add_argument("--train_batch_size",  type=int,   default=None)
-    p.add_argument("--temperature",       type=float, default=None)
-    p.add_argument("--max_turns_per_step",type=int,   default=None)
+    p.add_argument("--learning_rate",              type=float, default=None)
+    p.add_argument("--gamma",                      type=float, default=None, help="Discount factor")
+    p.add_argument("--kl_coeff",                   type=float, default=None, help="KL penalty weight")
+    p.add_argument("--train_batch_size",            type=int,   default=None)
+    p.add_argument("--gradient_accumulation_steps", type=int,   default=None,
+                   help="Optimizer step every N micro-batches (effective batch = train_batch_size × N)")
+    p.add_argument("--temperature",                type=float, default=None)
+    p.add_argument("--max_turns_per_step",         type=int,   default=None)
 
     # W&B
     p.add_argument("--wandb_project", default=None)
@@ -1281,10 +1289,23 @@ def main() -> None:
     # Build config: YAML base (if given) then CLI overrides
     if args.config:
         cfg = TrainingConfig.from_yaml(args.config)
-        # Apply CLI flags on top of YAML
-        cfg = TrainingConfig.from_args(args)  # from_args merges non-None values
+        cfg = TrainingConfig.from_args(args)
     else:
         cfg = TrainingConfig.from_args(args)
+
+    # Push episode-length / early-stop overrides to the env server via PATCH /config/env
+    env_patches: dict = {}
+    if getattr(args, "episode_weeks", None) is not None:
+        env_patches["episode_steps"] = args.episode_weeks
+    if getattr(args, "max_loss", None) is not None:
+        env_patches["max_cumulative_loss"] = args.max_loss
+    if env_patches:
+        try:
+            import requests
+            resp = requests.patch(f"{cfg.env_url.rstrip('/')}/config/env", json=env_patches, timeout=5)
+            print(f"[config] Patched env: {env_patches}  → HTTP {resp.status_code}")
+        except Exception as exc:
+            print(f"[config] Warning: could not patch env config: {exc}")
 
     # --dry_run takes precedence
     if args.dry_run or cfg.dry_run:

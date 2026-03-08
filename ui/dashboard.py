@@ -38,6 +38,8 @@ try:
     HAS_PLOTLY = True
 except ImportError:
     HAS_PLOTLY = False
+    go = None  # type: ignore
+    make_subplots = None  # type: ignore
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Global state (ring buffers for charts)
@@ -101,8 +103,8 @@ def _get(endpoint: str) -> dict:
 
 
 def call_tool(tool_name: str, params: dict | None = None) -> dict:
-    payload = {"tool": tool_name, "params": params or {}}
-    return _post("/step", payload)
+    action = {"type": "call_tool", "tool_name": tool_name, "arguments": params or {}}
+    return _post("/step", {"action": action})
 
 
 def reset_env(seed: int | None = None) -> dict:
@@ -673,6 +675,9 @@ def _log(msg: str) -> None:
 
 _OFFLINE_HTML = "<div style='color:#ef4444;padding:20px'>⚠ Server not reachable. Start with: <code>uvicorn server.app:app --port 8000</code></div>"
 
+# Minimal figure when plotly is not installed (Gradio Plot accepts dict)
+_PLACEHOLDER_FIG = {"data": [], "layout": {"annotations": [{"text": "Install plotly: uv sync --extra ui", "showarrow": False, "xref": "paper", "yref": "paper", "x": 0.5, "y": 0.5}]}}
+
 def refresh():
     if not health_check():
         return (
@@ -691,16 +696,23 @@ def refresh():
 
     _log(f"Step {step} | Cash ${a.get('cash_balance',0):,.0f} | Placed {a.get('num_candidates_placed',0)}")
 
+    if HAS_PLOTLY:
+        charts = (
+            chart_financials(),
+            chart_candidates(),
+            chart_satisfaction(),
+            chart_burn_runway(),
+            chart_market_demand(demand),
+            chart_placement_rate(),
+            chart_reward_history(),
+            chart_tool_usage(),
+        )
+    else:
+        charts = (_PLACEHOLDER_FIG,) * 8
+
     return (
         build_kpi_row(state),
-        chart_financials(),
-        chart_candidates(),
-        chart_satisfaction(),
-        chart_burn_runway(),
-        chart_market_demand(demand),
-        chart_placement_rate(),
-        chart_reward_history(),
-        chart_tool_usage(),
+        *charts,
         build_candidates_table(state),
         build_clients_table(state),
         build_projects_cards(state),
@@ -829,7 +841,7 @@ TOOL_PARAM_HINTS = {
 
 
 def build_ui():
-    with gr.Blocks(css=DARK_CSS, title="Staffing Agency RL Dashboard") as demo:
+    with gr.Blocks(title="Staffing Agency RL Dashboard") as demo:
 
         # ── Header ────────────────────────────────────────────────────────────
         gr.HTML("""
@@ -988,7 +1000,7 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--host",         default="0.0.0.0")
-    p.add_argument("--port",         type=int, default=7860)
+    p.add_argument("--port",         type=int, default=8002)
     p.add_argument("--server_url",   default="http://localhost:8000")
     p.add_argument("--start_server", action="store_true",
                    help="Auto-start the env server before launching UI")
@@ -1009,7 +1021,17 @@ if __name__ == "__main__":
         time.sleep(3)
         print("Env server started.")
 
-    print(f"\n🏢 Staffing Agency Dashboard → http://{args.host}:{args.port}")
-    print(f"   Connecting to env server: {_server_url}\n")
-
-    build_ui().launch(server_name=args.host, server_port=args.port, share=False)
+    demo = build_ui()
+    port = args.port
+    for _ in range(6):
+        try:
+            print(f"\n🏢 Staffing Agency Dashboard → http://{args.host}:{port}")
+            print(f"   Connecting to env server: {_server_url}\n")
+            demo.launch(server_name=args.host, server_port=port, share=False, css=DARK_CSS)
+            break
+        except OSError as e:
+            if "empty port" in str(e) and port < args.port + 5:
+                print(f"   Port {port} busy, trying {port + 1} …")
+                port += 1
+            else:
+                raise

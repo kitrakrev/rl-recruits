@@ -15,11 +15,12 @@ from typing import Literal, Any  # Any used in Config.update()
 @dataclass
 class Config:
     # --- Episode ---
-    episode_steps: int = 52          # 1 simulated business year
+    episode_steps: int = 10          # short horizon for fast backprop iteration
     seed_capital: float = 50_000.0
     reward_scale: float = 1_000.0    # divide raw $ reward by this for stability
     target_profit: float = 200_000.0
     win_bonus: float = 50_000.0
+    max_cumulative_loss: float = 3_000.0  # end episode early if total loss exceeds this
 
     # --- Curriculum stage ---
     curriculum_stage: Literal[1, 2, 3] = 3
@@ -53,11 +54,24 @@ class Config:
     cost_per_interview: float = 500.0
 
 
-    # --- Server behaviour penalties ---
-    # These are subtracted from total_reward in staffing_environment.step().
-    passive_streak_penalty: float = -50.0    # $ per turn after threshold consecutive GET calls
-    passive_streak_threshold: int = 3        # free GET-only turns before penalty kicks in
-    repeat_call_penalty: float = -100.0      # $ penalty for calling the same tool twice in a row
+    # --- Server behaviour penalties (reward shaping only, not real business costs) ---
+    # Kept SMALL (÷10) so they don't drown the positive learning signal.
+    passive_streak_penalty: float = -5.0       # per turn after threshold consecutive GET calls
+    passive_streak_threshold: int = 3          # free GET-only turns before penalty kicks in
+    repeat_call_penalty: float = -10.0         # same tool twice in a row (non-GET, non-retry)
+
+    # Workflow violation penalties — small enough to not overwhelm positive rewards
+    workflow_skip_penalty: float = -40.0       # hire without interview, match without hire
+    bad_target_penalty: float = -30.0          # acting on placed/wrong-status candidate
+    repeated_failure_penalty: float = -20.0    # same (tool, entity) fails again
+
+    # Shaping rewards — LARGE POSITIVE signals to guide the model toward correct workflow.
+    # The model must clearly see that interviewing → hiring → matching is the winning path.
+    shaping_interview: float = 600.0           # offsets -$500 cost → net +$100 (positive!)
+    shaping_hire: float = 2_500.0             # offsets -$2,000 cost → net +$500 (positive!)
+    shaping_confirm: float = 800.0             # committing to a project
+    shaping_match: float = 8_000.0            # CRITICAL: placing a candidate is the goal
+    shaping_negotiate_accepted: float = 400.0  # successful salary reduction
 
     # --- LLM ---
     llm_mode: Literal["stub", "live"] = "stub"

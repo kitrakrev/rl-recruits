@@ -35,14 +35,15 @@ class TrainingConfig:
     learning_rate: float = 5e-6
     gamma: float = 0.99             # discount factor for returns
     kl_coeff: float = 0.05          # KL penalty weight (prevents policy drift)
-    train_batch_size: int = 4       # steps per gradient accumulation batch
+    train_batch_size: int = 4       # micro-batch size (steps per backward call)
+    gradient_accumulation_steps: int = 4  # optimizer.step() every N micro-batches
     max_grad_norm: float = 1.0      # gradient clipping threshold
 
     # --- Generation ---
     max_turns_per_step: int = 10    # max tool calls per week before auto-advance
-    max_prompt_len: int = 2048      # left-truncation limit for prompt tokens
-    max_full_len: int = 2560        # truncation limit for prompt + completion
-    max_new_tokens: int = 512       # generation budget per turn
+    max_prompt_len: int = 1024      # left-truncation limit for prompt tokens (reduced for VRAM)
+    max_full_len: int = 1280        # truncation limit for prompt + completion
+    max_new_tokens: int = 256       # generation budget per turn (tool calls are short)
     # Qwen3 non-thinking mode recommended settings (HF model card)
     temperature: float = 0.7
     top_p: float = 0.8

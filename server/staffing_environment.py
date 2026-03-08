@@ -109,9 +109,10 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             raise
 
         self._state = StaffingState()
-        self._passive_streak: int = 0   # consecutive GET-only turns this episode
-        self._last_tool: str = ""        # last tool called, for repeat detection
-        self._last_tool_failed: bool = False  # was the last call a failure?
+        self._passive_streak: int = 0          # consecutive GET-only turns this episode
+        self._last_tool: str = ""              # last tool called, for repeat detection
+        self._last_tool_failed: bool = False   # was the last call a failure?
+        self._last_failed_action: tuple | None = None  # (tool, key_arg) of last failure
 
         # Reward capture: each MCP tool wrapper stores its reward here before
         # stripping the "reward" key from the dict it returns to the agent.
@@ -144,6 +145,7 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         self._passive_streak = 0
         self._last_tool = ""
         self._last_tool_failed = False
+        self._last_failed_action = None
         self._last_tool_reward = 0.0
         episode_id = episode_id or str(uuid4())
         self._state = StaffingState(
@@ -227,12 +229,78 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         self._state.revenue = self.core.revenue
         self._state.costs = self.core.costs
 
-        # Capture the tool's own reward (set by each wrapper into _last_tool_reward)
-        tool_reward = self._last_tool_reward
+        # ── Base tool reward (set by each wrapper into _last_tool_reward) ──────
+        # Scale raw dollar rewards so they don't swamp the shaping signals.
+        # Real costs (interview $500, hire $2000, bench burn $1500/wk) are large
+        # numbers that would make every positive shaping reward invisible.
+        # We keep the relative ordering but bring them into the same range as
+        # the shaping rewards (hundreds, not thousands).
+        _raw_reward = self._last_tool_reward
+        tool_reward = _raw_reward / 10.0         # ÷10: bench burn -1700 → -170, etc.
+        tool_name   = action.tool_name if hasattr(action, "tool_name") else ""
+        err_text    = (tr.get("error", "") + " " + tr.get("reason", "")).lower() if isinstance(tr, dict) else ""
 
-        # Repeat-call penalty: skip if the PREVIOUS call of the same tool failed
-        # (retrying after a genuine failure is correct behaviour, not spam).
-        tool_name = action.tool_name if hasattr(action, "tool_name") else ""
+        # ── Shaping: add positive signal for correct workflow steps ───────────
+        # Without shaping, real costs make successful steps look worse than
+        # doing nothing — the policy gradient would learn to avoid them.
+        if not self._last_tool_failed:
+            if tool_name == "interview_candidate":
+                tool_reward += self._config.shaping_interview      # offsets -$500 → net positive
+            elif tool_name == "hire_candidate":
+                tool_reward += self._config.shaping_hire           # offsets -$2,000 → net positive
+            elif tool_name == "confirm_project":
+                tool_reward += self._config.shaping_confirm
+            elif tool_name == "match_candidate_to_project":
+                # BIGGEST reward: placing a candidate is the whole point.
+                # Scale by match_score so better matches get more reward.
+                match_score = float(tr.get("match_score", 0.5)) if isinstance(tr, dict) else 0.5
+                tool_reward += self._config.shaping_match * max(0.3, match_score)
+            elif tool_name == "negotiate_salary" and isinstance(tr, dict) and tr.get("accepted"):
+                tool_reward += self._config.shaping_negotiate_accepted
+
+        # ── Failure penalties: semantic signals for wrong-workflow actions ─────
+        # All failed non-GET tools already return reward=0 from core.
+        # Add explicit negative shaping so the model learns what NOT to do.
+        failure_penalty = 0.0
+        if self._last_tool_failed:
+            if tool_name == "hire_candidate":
+                if "placed" in err_text:
+                    failure_penalty = self._config.bad_target_penalty      # hiring placed cand
+                elif "not found" in err_text or "not in market" in err_text:
+                    # Candidate not interviewed — classic workflow skip
+                    failure_penalty = self._config.workflow_skip_penalty
+                else:
+                    failure_penalty = self._config.bad_target_penalty
+            elif tool_name == "match_candidate_to_project":
+                if "hired" in err_text or "status" in err_text or "available" in err_text:
+                    failure_penalty = self._config.workflow_skip_penalty   # wrong status
+                else:
+                    failure_penalty = self._config.bad_target_penalty      # bad IDs
+            elif tool_name == "let_go_candidate" and "placed" in err_text:
+                failure_penalty = self._config.bad_target_penalty          # firing placed cand
+            elif tool_name in ("interview_candidate", "confirm_project", "pass_on_project"):
+                failure_penalty = -150.0                                   # bad ID / already done
+
+        # ── Repeated-failure penalty: same (tool, entity) fails again ─────────
+        # The find→hire alternation never hits repeat_call_penalty because the
+        # tool name changes. Track (tool, key_entity) pairs instead.
+        if hasattr(action, "arguments") and isinstance(action.arguments, dict):
+            args     = action.arguments
+            key_arg  = str(args.get("candidate_id") or args.get("project_id") or "")
+        else:
+            key_arg  = ""
+        failure_key  = (tool_name, key_arg) if tool_name and key_arg else None
+
+        repeated_fail_penalty = 0.0
+        if self._last_tool_failed and failure_key and failure_key == self._last_failed_action:
+            repeated_fail_penalty = self._config.repeated_failure_penalty
+
+        if self._last_tool_failed:
+            self._last_failed_action = failure_key
+        else:
+            self._last_failed_action = None   # clear on success
+
+        # ── Repeat-call penalty (same tool twice, non-GET, not a retry) ───────
         repeat_penalty = 0.0
         if (tool_name and tool_name == self._last_tool
                 and tool_name not in self._GET_TOOLS
@@ -240,7 +308,7 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             repeat_penalty = self._config.repeat_call_penalty
         self._last_tool = tool_name
 
-        # Passive-streak penalty: same — shaping only, not a business cost
+        # ── Passive-streak penalty ─────────────────────────────────────────────
         if tool_name in self._PASSIVE_TOOLS:
             self._passive_streak += 1
         else:
@@ -250,12 +318,23 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         if self._passive_streak > self._config.passive_streak_threshold:
             passive_penalty = self._config.passive_streak_penalty
 
-        total_reward = tool_reward + passive_penalty + repeat_penalty
+        total_reward = (tool_reward + failure_penalty + repeated_fail_penalty
+                        + passive_penalty + repeat_penalty)
         self._state.cumulative_reward += total_reward
+
+        # Cumulative-loss early stop: end early when cash has dropped by more
+        # than max_cumulative_loss from the starting capital. This lets backprop
+        # fire on shorter, information-dense episodes instead of waiting 52 weeks.
+        cash_loss = max(0.0, self._config.seed_capital - self._state.cash)
+        loss_limit_hit = (
+            self._config.max_cumulative_loss > 0
+            and cash_loss >= self._config.max_cumulative_loss
+        )
 
         done = (
             self._state.cash < 0
             or self._state.step_count >= self._config.episode_steps
+            or loss_limit_hit
         )
         self._state.done = done
         self._state.num_hired = sum(1 for c in self.core.candidates.values() if c.status in ("hired", "placed"))
@@ -264,19 +343,27 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         active = [cl for cl in self.core.clients if not cl.churn_risk]
         self._state.avg_satisfaction = sum(cl.satisfaction_score for cl in active) / len(active) if active else 0.0
 
+        done_reason = (
+            "max_loss" if loss_limit_hit
+            else ("bankrupt" if self._state.cash < 0 else "max_steps")
+        )
         logger.debug(
-            "[env.step] tool=%s  tool_rew=%+.2f  passive=%+.2f  repeat=%+.2f  "
-            "total=%+.2f  cash=$%s  profit=$%s  done=%s",
-            tool_name, tool_reward, passive_penalty, repeat_penalty, total_reward,
+            "[env.step] tool=%s  raw=%+.0f  scaled=%+.2f  shape=%+.2f  fail=%+.2f  "
+            "rep_fail=%+.2f  passive=%+.2f  repeat=%+.2f  total=%+.2f  cash=$%s  done=%s",
+            tool_name,
+            _raw_reward,
+            tool_reward,                           # after ÷10
+            tool_reward - _raw_reward / 10.0,      # shaping added on top
+            failure_penalty, repeated_fail_penalty,
+            passive_penalty, repeat_penalty, total_reward,
             f"{self._state.cash:,.0f}",
-            f"{self._state.revenue - self._state.costs:,.0f}",
             done,
         )
         if done:
             logger.warning(
-                "[env.step] Episode DONE  reason=%s  cash=$%s  step=%s",
-                "bankrupt" if self._state.cash < 0 else "max_steps",
-                f"{self._state.cash:,.0f}", self._state.step_count,
+                "[env.step] Episode DONE  reason=%s  cash=$%s  cash_loss=$%s  step=%s",
+                done_reason, f"{self._state.cash:,.0f}",
+                f"{cash_loss:,.0f}", self._state.step_count,
             )
 
         # Unwrap CallToolObservation → plain dict (strip reward key so agent never sees it)
@@ -482,20 +569,37 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             env._last_tool_reward = float(res.pop("reward", 0.0))
 
             if not res.get("success", True):
-                # Check if candidate is in market (needs interview) or truly gone
-                in_market = next((c for c in env.core.market if c.id == candidate_id), None)
-                if in_market:
+                in_market  = next((c for c in env.core.market if c.id == candidate_id), None)
+                in_roster  = env.core.candidates.get(candidate_id)
+
+                if in_roster and in_roster.status == "placed":
+                    # Model is trying to re-hire an already-placed candidate
+                    res["reason"] = (
+                        f"Candidate '{candidate_id}' is ALREADY PLACED on a project "
+                        f"(status='placed') and is currently earning you revenue. "
+                        f"Do NOT hire, match, or let_go a placed candidate."
+                    )
+                    res["fix"] = (
+                        "Leave placed candidates alone. "
+                        "Call find_candidate() to find NEW market candidates, "
+                        "then interview_candidate(), then hire_candidate() for those new IDs."
+                    )
+                    bench = [{"id": c.id, "type": c.developer_type, "status": c.status}
+                             for c in env.core.candidates.values() if c.status == "hired"]
+                    if bench:
+                        res["your_bench"] = bench
+                elif in_market:
                     res["reason"] = (
                         f"Candidate '{candidate_id}' IS in the market but has NOT been interviewed yet. "
-                        f"You MUST call interview_candidate(candidate_id=\"{candidate_id}\") FIRST, "
-                        f"then hire_candidate(candidate_id=\"{candidate_id}\")."
+                        f"You MUST call interview_candidate(candidate_id=\"{candidate_id}\") FIRST."
                     )
                     res["fix"] = f"Call interview_candidate(candidate_id=\"{candidate_id}\") now."
                 else:
                     market_now = [{"id": c.id, "type": c.developer_type, "seniority": c.seniority_level}
                                   for c in env.core.market[:8]]
                     res["reason"] = (
-                        f"Candidate '{candidate_id}' no longer exists (left market or wrong ID). "
+                        f"Candidate '{candidate_id}' not found in market or roster "
+                        f"(may have left, or ID was invented). "
                         f"Current market has {len(env.core.market)} candidates."
                     )
                     res["current_market_ids"] = market_now
@@ -622,13 +726,24 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             res = env.core.tool_let_go_candidate(candidate_id)
             env._last_tool_reward = float(res.pop("reward", 0.0))
             if not res.get("success", True):
-                hired = [{"id": c.id, "type": c.developer_type, "status": c.status,
-                          "salary_weekly": round(c.salary_weekly, 2)}
-                         for c in env.core.candidates.values()
-                         if c.status in ("hired", "in_pipeline")]
-                res["reason"] = f"Candidate '{candidate_id}' not found in your roster."
-                res["your_hired_candidates"] = hired
-                res["fix"] = "Use an ID from 'your_hired_candidates'. Call get_candidate_state() to refresh."
+                # Distinguish: trying to fire a placed candidate vs truly not found
+                in_roster = env.core.candidates.get(candidate_id)
+                if in_roster and in_roster.status == "placed":
+                    res["reason"] = (
+                        f"Candidate '{candidate_id}' is PLACED on a project and earning revenue. "
+                        f"Do NOT let_go a placed candidate — that would cost severance AND lose the revenue."
+                    )
+                    res["fix"] = (
+                        "Only let_go bench candidates (status='hired') who cannot be matched. "
+                        "Leave placed candidates alone."
+                    )
+                else:
+                    bench = [{"id": c.id, "type": c.developer_type, "status": c.status,
+                              "salary_weekly": round(c.salary_weekly, 2)}
+                             for c in env.core.candidates.values() if c.status == "hired"]
+                    res["reason"] = f"Candidate '{candidate_id}' not found in your bench."
+                    res["your_bench"] = bench
+                    res["fix"] = "Use an ID from 'your_bench'. Call get_candidate_state() to see current roster."
             return res
 
         @mcp.tool()
