@@ -818,7 +818,7 @@ def train_grpo(args):
     print(f"Loading model: {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
-    env_client = StaffingAgencyEnv(base_url=args.env_url).sync()
+    env_client = StaffingAgencyEnv(base_url=args.env_url)
 
     def rollout_func(prompts: list[str], trainer: GRPOTrainer):
         """OpenEnv rollout function for GRPOTrainer."""
