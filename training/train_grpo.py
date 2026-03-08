@@ -819,18 +819,29 @@ def train_grpo(args):
     # -----------------------------------------------------------------------
     # Env helpers — use sync HTTP directly (same as dry_run)
     # -----------------------------------------------------------------------
-    _env_state = {"reward": 0.0}  # shared state for reward fn
 
-    def _http_step(tool_name: str, params: dict) -> float:
-        """Execute one tool call and return env reward."""
+    # Tracking state for reward curves + metrics (mirrors dry_run output)
+    _tracking = {
+        "episode_rewards": [],   # cumulative reward per episode
+        "episode_profits": [],   # net profit per episode
+        "_cur_reward": 0.0,      # running reward for current episode
+        "_step": 0,              # global step counter
+        "_ep_step": 0,           # steps within current episode
+    }
+    _STEPS_PER_EPISODE = 52  # matches env config
+
+    def _http_step(tool_name: str, params: dict) -> tuple[float, float]:
+        """Execute one tool call. Returns (reward, profit)."""
         try:
             with StaffingAgencyEnv(base_url=args.env_url) as _env:
                 from models import StaffingAction
                 result = _env.step(StaffingAction(tool=tool_name, params=params))
-                return float(result.reward or 0.0)
+                reward = float(result.reward or 0.0)
+                profit = float(result.observation.profit or 0.0)
+                return reward, profit
         except Exception as e:
             print(f"[!] env step error: {e}")
-            return -0.1
+            return -0.1, 0.0
 
     def _http_reset() -> str:
         """Reset env and return initial observation text."""
@@ -845,7 +856,7 @@ def train_grpo(args):
             return f"Episode started. (reset error: {e})"
 
     # -----------------------------------------------------------------------
-    # Reward function — executes tool in env, returns reward
+    # Reward function — executes tool in env, returns reward + tracks metrics
     # -----------------------------------------------------------------------
     def reward_fn_profit(completions: list[str], **kwargs) -> list[float]:
         """Primary reward: run the tool call against the live env."""
@@ -854,9 +865,30 @@ def train_grpo(args):
             parsed = parse_tool_call(c)
             if parsed:
                 tool_name, params = parsed
-                rewards.append(_http_step(tool_name, params))
+                reward, profit = _http_step(tool_name, params)
             else:
-                rewards.append(-0.1)
+                reward, profit = -0.1, 0.0
+
+            rewards.append(reward)
+
+            # Track per-episode metrics
+            _tracking["_cur_reward"] += reward
+            _tracking["_ep_step"] += 1
+            _tracking["_step"] += 1
+
+            # Episode boundary: flush accumulated reward/profit
+            if _tracking["_ep_step"] >= _STEPS_PER_EPISODE:
+                _tracking["episode_rewards"].append(_tracking["_cur_reward"])
+                _tracking["episode_profits"].append(profit)
+                _tracking["_cur_reward"] = 0.0
+                _tracking["_ep_step"] = 0
+                ep_num = len(_tracking["episode_rewards"])
+                print(
+                    f"  [train] ep={ep_num:4d}  "
+                    f"reward={_tracking['episode_rewards'][-1]:+8.3f}  "
+                    f"profit=${profit:>10,.0f}"
+                )
+
         return rewards
 
     # -----------------------------------------------------------------------
@@ -918,6 +950,26 @@ def train_grpo(args):
     trainer.train()
     trainer.save_model(args.output_dir)
     print(f"\n[✓] Training complete. Model saved to {args.output_dir}")
+
+    # -----------------------------------------------------------------------
+    # Save reward curves + metrics (same as dry_run)
+    # -----------------------------------------------------------------------
+    if _tracking["episode_rewards"]:
+        # Flush any partial episode at end of training
+        if _tracking["_ep_step"] > 0:
+            _tracking["episode_rewards"].append(_tracking["_cur_reward"])
+            _tracking["episode_profits"].append(0.0)
+
+        results = {
+            "grpo_training": {
+                "rewards": _tracking["episode_rewards"],
+                "profits": _tracking["episode_profits"],
+            }
+        }
+        _plot_reward_curves(results, len(_tracking["episode_rewards"]))
+        _save_metrics(results)
+    else:
+        print("[!] No episode data collected — reward curves not saved.")
 
 
 # ---------------------------------------------------------------------------
