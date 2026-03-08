@@ -848,6 +848,10 @@ def train_grpo(args):
     # -----------------------------------------------------------------------
     # Reward function — executes tool in env, returns reward
     # -----------------------------------------------------------------------
+    # Shared list: reward_fn_profit appends actual dollar profit here so the
+    # MetricsCallback can read it for the reward-curve / metrics output.
+    _actual_profits: list[float] = []
+
     def reward_fn_profit(completions: list[str], **kwargs) -> list[float]:
         """Primary reward: run the tool call against the live env."""
         rewards = []
@@ -855,9 +859,11 @@ def train_grpo(args):
             parsed = parse_tool_call(c)
             if parsed:
                 tool_name, params = parsed
-                reward, _ = _http_step(tool_name, params)
+                reward, profit = _http_step(tool_name, params)
+                _actual_profits.append(profit)
             else:
                 reward = -0.1
+                _actual_profits.append(0.0)
             rewards.append(reward)
         return rewards
 
@@ -877,16 +883,18 @@ def train_grpo(args):
             if logs is None:
                 return
             step_r = logs.get("reward", logs.get("rewards/reward_fn_profit/mean", 0.0))
-            env_r  = logs.get("rewards/reward_fn_profit/mean", 0.0)
             loss   = logs.get("train_loss", logs.get("loss", None))
             self.step_rewards.append(float(step_r))
-            self.step_profits.append(float(env_r))
+            # Use actual dollar profit collected by reward_fn_profit if available
+            if _actual_profits:
+                self.step_profits.append(float(_actual_profits[-1]))
             if loss is not None:
                 self.step_losses.append(float(loss))
+            profit_display = _actual_profits[-1] if _actual_profits else 0.0
             print(
                 f"  [train] step={state.global_step:4d}  "
                 f"reward={float(step_r):+7.4f}  "
-                f"env_reward={float(env_r):+7.4f}"
+                f"profit=${profit_display:>10,.0f}"
                 + (f"  loss={float(loss):.4f}" if loss is not None else "")
             )
 
@@ -957,19 +965,26 @@ def train_grpo(args):
     # Save reward curves + metrics using captured callback data
     # -----------------------------------------------------------------------
     step_rewards = metrics_cb.step_rewards
-    step_profits = metrics_cb.step_profits
+    # Prefer actual dollar profits tracked inside reward_fn_profit; fall back
+    # to the per-step profits the callback recorded from logs.
+    step_profits = _actual_profits if _actual_profits else metrics_cb.step_profits
 
     if not step_rewards:
         # Fallback: extract from trainer.state.log_history
         step_rewards = [
-            float(log.get("reward", log.get("rewards/reward_fn_profit/mean", 0.0)))
+            float(log.get("reward", 0.0))
             for log in trainer.state.log_history
-            if "reward" in log or "rewards/reward_fn_profit/mean" in log
+            if "reward" in log
         ]
+
+    # Align lengths (step_profits may have more entries — one per completion,
+    # not one per logged step).  Downsample to match step_rewards length.
+    if step_profits and len(step_profits) != len(step_rewards):
+        # Take one profit sample per training step (last completion in that step)
+        n_gen = training_args.num_generations  # completions per step
         step_profits = [
-            float(log.get("rewards/reward_fn_profit/mean", 0.0))
-            for log in trainer.state.log_history
-            if "rewards/reward_fn_profit/mean" in log
+            step_profits[min(i * n_gen + n_gen - 1, len(step_profits) - 1)]
+            for i in range(len(step_rewards))
         ]
 
     if step_rewards:
