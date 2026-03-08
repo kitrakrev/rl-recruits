@@ -48,9 +48,19 @@ uv run python training/train_grpo.py --dry_run --num_episodes 90
 ## Observation Space
 25-dim float32: [cash, profit, burn, runway | hired, placed, benched, pipeline, placement_rate, avg_ttp | 5×demand, n_projects, open_slots, 3×deadline_hist | n_active_clients, avg_sat, n_churn_risk | n_churn_candidates, avg_bench_weeks]
 
-## Economics (key numbers)
-- Rating-5 placed: +$625/wk margin
-- Rating-5 benched: −$2,500/wk
-- Onboarding: −$2,000 one-time
-- Severance: 2× weekly salary
-- Margin always 25% of client rate
+## Economics (key numbers — updated)
+- Interview cost: −$500 per candidate screened (returned in reward field)
+- Salary is DYNAMIC: salary_expectation = base × role_multiplier × skill_modifier × ±20% RNG
+  → base: Junior $75k, Mid $110k, Senior $150k; multipliers: frontend 1.0, backend 1.05, devops 1.15, ML 1.3
+- Bill rate is VARIABLE per role: client pays $130k–$300k+/yr (1.3×–2.0× base × scarcity)
+- TRUE MARGIN = role.bill_rate_weekly − candidate.salary_weekly (not a fixed 25%)
+  → A losing placement is possible if salary > bill_rate
+- Onboarding: −$2,000 one-time; Severance: 2× weekly salary
+- Bench burn: candidate.salary_weekly per week (dynamic)
+
+## train_grpo.py Iterative Loop (implemented)
+- PHASE 1 (Rollout): play N full 52-step episodes with current model → record prompts/completions/final_profit
+- PHASE 2 (Dataset): assign final_profit as Monte Carlo return to EVERY step in trajectory
+- PHASE 3 (Train): run GRPOTrainer for 1 epoch on this dataset
+- PHASE 4 (Repeat): loop back. Graphs plot true episode profit over training iterations.
+- reward_fn_mc_profit receives mc_return column from dataset (final_profit / 1000 for stability)

@@ -26,6 +26,7 @@ class Candidate:
     client_rate_weekly: float = 0.0
     margin_weekly: float = 0.0
     salary_expectation: float = 0.0   # minimum acceptable weekly salary
+    ttl_weeks: int = 8                 # market TTL (set at generation, organic churn countdown)
 
     patience_remaining: int = 8
     status: str = "available"         # available|in_pipeline|pending_hire|hired|placed
@@ -57,6 +58,7 @@ class Role:
     seniority: str
     min_skill_score: float
     headcount: int
+    bill_rate_weekly: float = 0.0
     filled_count: int = 0
     assigned: list = field(default_factory=list)   # list of candidate_ids
 

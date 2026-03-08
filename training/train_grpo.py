@@ -51,19 +51,26 @@ Your goal is to maximise profit over 52 business weeks by:
 3. Managing client relationships and filling projects before deadlines
 4. Balancing bench costs (hired-but-unplaced = salary drain) vs revenue
 
-CRITICAL ECONOMICS:
-- Placed candidate = +$265 to +$625/week MARGIN (profit)
-- Benched candidate = -$1,058 to -$2,500/week BURN
-- Hiring costs $2,000 onboarding upfront
-- Projects must be FULLY filled to generate any revenue
-- Expired projects = large penalty
-- Client churn (satisfaction < 0.3) = $50,000 LTV penalty
+CRITICAL ECONOMICS (updated):
+- Interview costs $500 per candidate screened — be selective
+- Salary is DYNAMIC: every candidate has a unique salary_expectation (their floor)
+  → Junior backend ~$75k/yr, Senior ML Engineer ~$150k × 1.3 × skill modifier
+- Bill rate is VARIABLE per role: what the client pays (set by project, $130k–$300k+/yr)
+- TRUE MARGIN = bill_rate_weekly − salary_weekly per placed candidate per week
+  → A cheap junior (salary $1,200/wk) on a $3,000/wk bill-rate role = +$1,800/wk profit
+  → An expensive senior ($3,000/wk) on a $2,800/wk role = −$200/wk LOSS every week
+- Benched candidate = −salary_weekly BURN per week (dynamic, not fixed)
+- Onboarding: −$2,000 one-time per hire
+- Projects must be FULLY filled (SEALED) to lock in recurring revenue
+- Expired projects = large penalty; client churn (satisfaction < 0.3) = $50,000 LTV loss
 
 STRATEGY HINTS:
-- Always check market demand before hiring (get_market_demand)
+- Use negotiate_salary to lower a candidate's salary before hiring them
+- Check bill_rate_weekly on each role before committing a candidate — only place where margin > 0
+- Use get_market_demand to identify which developer types are most needed
 - Confirm projects before committing candidates (confirm_project)
-- High-rating candidates earn more but cost more to bench — place them fast
-- Pass on projects you cannot fill rather than letting them expire
+- Pass on projects where you cannot fill all roles — preventing expiry avoids the penalty
+- Let go of benched candidates whose salary exceeds any available bill rate (they lose money)
 
 Use the available tools to manage your agency. Think step by step.
 When you want to call a tool, output EXACTLY:
@@ -76,6 +83,9 @@ PARAMS: {}
 
 TOOL: find_candidate
 PARAMS: {"developer_type": "backend"}
+
+TOOL: negotiate_salary
+PARAMS: {"candidate_id": "C-BA-abc12345", "offer_weekly": 1400.0}
 
 TOOL: match_candidate_to_project
 PARAMS: {"candidate_id": "C-BA-abc12345", "project_id": "P-CL-001-xyz", "role_id": "R-P-CL-001-xyz-0"}
@@ -760,11 +770,20 @@ def _plot_reward_curves(results: dict, n_episodes: int):
         axes[1].grid(alpha=0.3)
         axes[1].yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
 
-        plt.suptitle(
-            "Staffing Agency RL — Policy Comparison\n"
-            "random → greedy → optimal heuristic (simulates training progression)",
-            fontsize=11,
-        )
+        # Title adapts to whether this is a dry-run policy comparison or a
+        # live GRPO training run with the iterative Monte Carlo loop.
+        is_grpo = "grpo_mc_training" in results
+        if is_grpo:
+            suptitle = (
+                "Staffing Agency RL — GRPO Monte Carlo Training\n"
+                "Iterative loop: rollout 52 weeks → assign episode profit → 1-epoch GRPO update"
+            )
+        else:
+            suptitle = (
+                "Staffing Agency RL — Policy Comparison\n"
+                "random → greedy → optimal heuristic (simulates training progression)"
+            )
+        plt.suptitle(suptitle, fontsize=11)
         plt.tight_layout()
         plt.savefig("training/reward_curves.png", dpi=150, bbox_inches="tight")
         plt.close()
@@ -798,11 +817,31 @@ def _save_metrics(results: dict):
 
 
 # ---------------------------------------------------------------------------
-# Full TRL GRPO training (requires GPU + model)
+# Full TRL GRPO training — Iterative Monte Carlo Rollout Loop
+#
+# The core insight: TRL's GRPOTrainer is a single-turn prompt→completion
+# optimizer.  If we hand it a static dataset of Week-1 prompts and run it
+# end-to-end, it only ever optimises the FIRST action in the 52-step game —
+# the other 51 weeks are invisible to the gradient.
+#
+# The fix: an outer ITERATIVE loop.
+#   1. ROLLOUT PHASE  — Use the CURRENT model to play N full 52-week episodes
+#      against the live StaffingAgencyEnv.  Record every (prompt, completion)
+#      pair along with the episode's final profit.
+#   2. DATASET PHASE  — Assign the final episode profit as the reward for EVERY
+#      step in the trajectory (Monte Carlo return: all actions in a good episode
+#      get positive signal; all actions in a bad episode get negative signal).
+#   3. TRAIN PHASE    — Construct a fresh Dataset from this trajectory and run
+#      GRPOTrainer for 1 epoch.  The model sees the full 52-step context.
+#   4. REPEAT         — Loop back to Phase 1.  As the model improves, profit rises.
+#
+# Graphs: we hook directly into the outer loop's final_profit list, so the
+# "Profit per Episode" curve reflects true 52-week episode outcomes — not the
+# reward from a single tool call.
 # ---------------------------------------------------------------------------
 
 def train_grpo(args):
-    """Full GRPO training loop using TRL."""
+    """Iterative Monte Carlo GRPO training loop using TRL."""
     try:
         from trl import GRPOTrainer, GRPOConfig
         from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -814,120 +853,13 @@ def train_grpo(args):
         sys.exit(1)
 
     from client import StaffingAgencyEnv
+    from models import StaffingAction
     from datasets import Dataset
 
-    # -----------------------------------------------------------------------
-    # Env helpers — use sync HTTP directly (same as dry_run)
-    # -----------------------------------------------------------------------
-
-    def _http_step(tool_name: str, params: dict) -> tuple[float, float]:
-        """Execute one tool call. Returns (reward, profit)."""
-        try:
-            with StaffingAgencyEnv(base_url=args.env_url) as _env:
-                from models import StaffingAction
-                result = _env.step(StaffingAction(tool=tool_name, params=params))
-                reward = float(result.reward or 0.0)
-                profit = float(result.observation.profit or 0.0)
-                return reward, profit
-        except Exception as e:
-            print(f"[!] env step error: {e}")
-            return -0.1, 0.0
-
-    def _http_reset() -> str:
-        """Reset env and return initial observation text."""
-        try:
-            resp = _req.post(f"{args.env_url}/reset", json={"seed": args.seed}, timeout=10)
-            data = resp.json()
-            obs = data.get("observation", {})
-            if isinstance(obs, dict):
-                return obs.get("message", str(obs))
-            return str(data)
-        except Exception as e:
-            return f"Episode started. (reset error: {e})"
-
-    # -----------------------------------------------------------------------
-    # Reward function — executes tool in env, returns reward
-    # -----------------------------------------------------------------------
-    def reward_fn_profit(completions: list[str], **kwargs) -> list[float]:
-        """Primary reward: run the tool call against the live env."""
-        rewards = []
-        for c in completions:
-            parsed = parse_tool_call(c)
-            if parsed:
-                tool_name, params = parsed
-                reward, _ = _http_step(tool_name, params)
-            else:
-                reward = -0.1
-            rewards.append(reward)
-        return rewards
-
-    # -----------------------------------------------------------------------
-    # Callback — captures TRL's per-step logs for reward curves + metrics
-    # -----------------------------------------------------------------------
-    from transformers import TrainerCallback
-
-    class MetricsCallback(TrainerCallback):
-        """Collects per-step metrics from TRL trainer logs."""
-        def __init__(self):
-            self.step_rewards = []     # reward/mean per logged step
-            self.step_profits = []     # env reward (profit signal) per logged step
-            self.step_losses  = []     # train_loss per logged step
-
-        def on_log(self, _args, state, control, logs=None, **kwargs):
-            if logs is None:
-                return
-            step_r = logs.get("reward", logs.get("rewards/reward_fn_profit/mean", 0.0))
-            env_r  = logs.get("rewards/reward_fn_profit/mean", 0.0)
-            loss   = logs.get("train_loss", logs.get("loss", None))
-            self.step_rewards.append(float(step_r))
-            self.step_profits.append(float(env_r))
-            if loss is not None:
-                self.step_losses.append(float(loss))
-            print(
-                f"  [train] step={state.global_step:4d}  "
-                f"reward={float(step_r):+7.4f}  "
-                f"env_reward={float(env_r):+7.4f}"
-                + (f"  loss={float(loss):.4f}" if loss is not None else "")
-            )
-
-    metrics_cb = MetricsCallback()
-
-    # -----------------------------------------------------------------------
-    # Dataset — varied initial state prompts
-    # -----------------------------------------------------------------------
-    print(f"Loading model: {args.model_name}")
+    print(f"\nLoading model: {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-
-    initial_obs = _http_reset()
-
-    def _make_prompt(obs_text: str) -> str:
-        return tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Current state:\n{obs_text}\nWhat is your action?"},
-            ],
-            tokenize=False, add_generation_prompt=True,
-        )
-
-    dataset = Dataset.from_dict({
-        "prompt": [_make_prompt(initial_obs)] * args.num_episodes
-    })
-
-    # -----------------------------------------------------------------------
-    # Training config
-    # -----------------------------------------------------------------------
-    training_args = GRPOConfig(
-        output_dir=args.output_dir,
-        num_train_epochs=1,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=4,
-        num_generations=4,          # must divide generation_batch_size (1×4=4)
-        learning_rate=5e-6,
-        max_completion_length=256,
-        logging_steps=1,    # log every step so metrics are always captured
-        save_steps=50,
-        seed=args.seed,
-    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
@@ -935,54 +867,238 @@ def train_grpo(args):
         device_map="auto",
     )
 
-    # GRPOTrainer: reward_funcs is the only list of reward callables needed.
-    # Each function receives (completions: list[str], **kwargs) → list[float].
-    trainer = GRPOTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset,
-        processing_class=tokenizer,
-        reward_funcs=[reward_fn_profit, reward_fn_tool_format, reward_fn_placement],
-        callbacks=[metrics_cb],
+    # -----------------------------------------------------------------------
+    # Rollout: play one full 52-step episode, return (prompts, completions, profit)
+    # -----------------------------------------------------------------------
+    def rollout_full_episode(env: "StaffingAgencyEnv", seed: int) -> tuple[list[str], list[str], float]:
+        """
+        Run one complete 52-week episode.
+
+        Returns:
+          prompts      — list of prompt strings (one per week step)
+          completions  — list of model completion strings (one per week step)
+          final_profit — episode-end net profit ($)
+        """
+        env.reset(seed=seed)
+        prompts_out: list[str] = []
+        completions_out: list[str] = []
+        final_profit = 0.0
+
+        # Seed the conversation with initial state observation
+        obs_text = "Episode started. Week 1 of 52."
+        try:
+            fin = env.step(StaffingAction(tool="get_financial_summary", params={}))
+            obs_text = json.dumps((fin.observation.tool_result or {}), indent=2)
+            final_profit = float((fin.observation.tool_result or {}).get("profit", 0.0))
+        except Exception:
+            pass
+
+        conversation = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": f"Week 1 of 52. Current financials:\n{obs_text}\nWhat is your action?"},
+        ]
+
+        for week in range(1, 53):
+            # Build prompt string for this step
+            prompt_str = tokenizer.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=True
+            )
+
+            # Generate one completion from the model
+            input_ids = tokenizer(
+                prompt_str, return_tensors="pt", truncation=True, max_length=2048
+            ).input_ids.to(model.device)
+
+            with torch.no_grad():
+                out_ids = model.generate(
+                    input_ids,
+                    max_new_tokens=128,
+                    do_sample=True,
+                    temperature=0.8,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            # Extract only the newly generated tokens
+            completion_ids = out_ids[0][input_ids.shape[-1]:]
+            completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+
+            # Execute the tool call in the environment
+            parsed = parse_tool_call(completion_text)
+            reward = 0.0
+            tool_result_text = "No tool parsed — no action taken."
+            done = (week == 52)
+
+            if parsed:
+                tool_name, params = parsed
+                try:
+                    result = env.step(StaffingAction(tool=tool_name, params=params))
+                    reward = float(result.reward or 0.0)
+                    tr = result.observation.tool_result or {}
+                    tool_result_text = json.dumps(tr, indent=2)[:400]
+                    # Track latest profit from every get_financial_summary call
+                    if isinstance(tr, dict) and "profit" in tr:
+                        final_profit = float(tr["profit"])
+                    done = result.done or done
+                except Exception as e:
+                    tool_result_text = f"Error: {e}"
+
+            prompts_out.append(prompt_str)
+            completions_out.append(completion_text)
+
+            if done:
+                break
+
+            # Update conversation with result
+            conversation.append({"role": "assistant", "content": completion_text})
+            conversation.append({
+                "role": "user",
+                "content": (
+                    f"Week {week + 1} of 52. Tool result:\n{tool_result_text}\n"
+                    f"Step reward: {reward:+.2f}\n"
+                    "What is your next action?"
+                ),
+            })
+
+        # Final profit snapshot
+        try:
+            fin = env.step(StaffingAction(tool="get_financial_summary", params={}))
+            final_profit = float((fin.observation.tool_result or {}).get("profit", final_profit))
+        except Exception:
+            pass
+
+        return prompts_out, completions_out, final_profit
+
+    # -----------------------------------------------------------------------
+    # Reward functions used by GRPOTrainer (single-step, called per completion)
+    # They receive the Monte Carlo return injected via the dataset column.
+    # -----------------------------------------------------------------------
+    def reward_fn_mc_profit(completions: list[str], mc_return: list[float] = None, **kwargs) -> list[float]:
+        """Monte Carlo return: final episode profit assigned to every step."""
+        if mc_return:
+            return [float(r) / 1_000.0 for r in mc_return]   # scale for stability
+        return [0.0] * len(completions)
+
+    def reward_fn_tool_format(completions: list[str], **kwargs) -> list[float]:
+        """Shaping: +0.1 for valid TOOL:/PARAMS: format."""
+        rewards = []
+        for c in completions:
+            if "TOOL:" in c and "PARAMS:" in c:
+                rewards.append(0.1 if parse_tool_call(c) else -0.05)
+            else:
+                rewards.append(-0.1)
+        return rewards
+
+    def reward_fn_placement(completions: list[str], **kwargs) -> list[float]:
+        """Shaping: bonus for high-value action types."""
+        rewards = []
+        for c in completions:
+            parsed = parse_tool_call(c)
+            if parsed and parsed[0] == "match_candidate_to_project":
+                rewards.append(0.2)
+            elif parsed and parsed[0] in ("hire_candidate", "negotiate_salary"):
+                rewards.append(0.05)
+            else:
+                rewards.append(0.0)
+        return rewards
+
+    # -----------------------------------------------------------------------
+    # Training config — 1 epoch per outer iteration (fresh dataset each time)
+    # -----------------------------------------------------------------------
+    grpo_config = GRPOConfig(
+        output_dir=args.output_dir,
+        num_train_epochs=1,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=4,
+        num_generations=4,
+        learning_rate=5e-6,
+        max_completion_length=128,
+        logging_steps=1,
+        save_steps=50,
+        seed=args.seed,
+        # Disable default reward normalization so MC returns pass through cleanly
+        missing_eos_penalty=0.0,
     )
 
-    print(f"\nStarting GRPO training: {args.num_episodes} episodes")
-    print(f"Model: {args.model_name}")
-    print(f"Environment: {args.env_url}")
-    trainer.train()
+    # -----------------------------------------------------------------------
+    # Outer iterative loop
+    # -----------------------------------------------------------------------
+    rng = random.Random(args.seed)
+    all_profits: list[float] = []          # one entry per episode, for graphing
+    all_rewards: list[float] = []
+
+    print(f"\nStarting iterative GRPO training")
+    print(f"  model:    {args.model_name}")
+    print(f"  env:      {args.env_url}")
+    print(f"  episodes: {args.num_episodes}  (each = 52-step rollout + 1-epoch train)")
+
+    # Verify env is up
+    try:
+        import requests as _req
+        _req.get(f"{args.env_url}/health", timeout=5).raise_for_status()
+        print("[✓] Environment server is healthy\n")
+    except Exception as e:
+        print(f"[✗] Server not reachable at {args.env_url}: {e}")
+        print("    Start it with: uvicorn server.app:app --host 0.0.0.0 --port 8000")
+        sys.exit(1)
+
+    with StaffingAgencyEnv(base_url=args.env_url) as env:
+        for ep in range(args.num_episodes):
+            ep_seed = rng.randint(0, 99_999)
+
+            # ---- PHASE 1: Rollout ----------------------------------------
+            prompts, completions, final_profit = rollout_full_episode(env, ep_seed)
+
+            # ---- PHASE 2: Dataset construction (Monte Carlo return) -------
+            # Every (prompt, completion) pair in this episode gets the SAME
+            # final_profit as its reward signal.  Good episodes reinforce ALL
+            # actions taken; bad episodes suppress them — Monte Carlo credit.
+            mc_returns = [final_profit] * len(prompts)
+            dataset = Dataset.from_dict({
+                "prompt":     prompts,
+                "completion": completions,
+                "mc_return":  mc_returns,
+            })
+
+            # ---- PHASE 3: One epoch of GRPO training ----------------------
+            trainer = GRPOTrainer(
+                model=model,
+                args=grpo_config,
+                train_dataset=dataset,
+                processing_class=tokenizer,
+                reward_funcs=[reward_fn_mc_profit, reward_fn_tool_format, reward_fn_placement],
+            )
+            trainer.train()
+
+            # ---- Record metrics -------------------------------------------
+            all_profits.append(final_profit)
+            # Average reward from trainer log
+            ep_reward = 0.0
+            for log in trainer.state.log_history:
+                ep_reward = log.get("reward", log.get("rewards/reward_fn_mc_profit/mean", ep_reward))
+            all_rewards.append(float(ep_reward))
+
+            if ep % max(1, args.num_episodes // 10) == 0:
+                print(
+                    f"  Episode {ep:4d}/{args.num_episodes}  "
+                    f"profit=${final_profit:>10,.0f}  "
+                    f"steps={len(prompts)}  "
+                    f"reward={float(ep_reward):+.4f}"
+                )
+
+    # Save model
     trainer.save_model(args.output_dir)
     print(f"\n[✓] Training complete. Model saved to {args.output_dir}")
 
     # -----------------------------------------------------------------------
-    # Save reward curves + metrics using captured callback data
+    # Graphs — plot true episode profit over training iterations
     # -----------------------------------------------------------------------
-    step_rewards = metrics_cb.step_rewards
-    step_profits = metrics_cb.step_profits
-
-    if not step_rewards:
-        # Fallback: extract from trainer.state.log_history
-        step_rewards = [
-            float(log.get("reward", log.get("rewards/reward_fn_profit/mean", 0.0)))
-            for log in trainer.state.log_history
-            if "reward" in log or "rewards/reward_fn_profit/mean" in log
-        ]
-        step_profits = [
-            float(log.get("rewards/reward_fn_profit/mean", 0.0))
-            for log in trainer.state.log_history
-            if "rewards/reward_fn_profit/mean" in log
-        ]
-
-    if step_rewards:
-        results = {
-            "grpo_training": {
-                "rewards": step_rewards,
-                "profits": step_profits if step_profits else step_rewards,
-            }
+    results = {
+        "grpo_mc_training": {
+            "rewards": all_rewards,
+            "profits": all_profits,
         }
-        _plot_reward_curves(results, len(step_rewards))
-        _save_metrics(results)
-    else:
-        print("[!] No step data collected — reward curves not saved.")
+    }
+    _plot_reward_curves(results, len(all_profits))
+    _save_metrics(results)
 
 
 # ---------------------------------------------------------------------------

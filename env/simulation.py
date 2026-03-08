@@ -32,10 +32,18 @@ def generate_candidate(config: "Config", rng: random.Random) -> Candidate:
     raw = rng.betavariate(2, 2)
     skill = round(0.3 + raw * 0.7, 3)
 
-    # salary_expectation: roughly market weekly rate ±10%
-    # Use rating=3 (average) as baseline expectation before interview
-    baseline_weekly = 85_000 / 52
-    expectation = round(baseline_weekly * rng.uniform(0.85, 1.15), 2)
+    # Dynamic salary expectation: base × role_multiplier × skill_modifier × ±20% rng variance
+    base = config.base_salaries.get(seniority, 85_000)
+    mult = config.role_multipliers.get(dev_type, 1.0)
+
+    # skill_score biases expectation: high-skill candidates demand more
+    skill_modifier = 0.8 + skill * 0.4   # maps [0.3,1.0] → [0.92, 1.20]
+
+    # ±20% pure RNG variance on top
+    variance = rng.uniform(0.80, 1.20)
+    annual_expectation = base * mult * skill_modifier * variance
+
+    expectation_weekly = round(annual_expectation / 52, 2)
 
     patience = config.t_patience + rng.randint(-2, 2)
     patience = max(4, patience)
@@ -46,10 +54,12 @@ def generate_candidate(config: "Config", rng: random.Random) -> Candidate:
         developer_type=dev_type,
         seniority_level=seniority,
         skill_score=skill,
-        salary_expectation=expectation,
+        salary_expectation=expectation_weekly,
         patience_remaining=patience,
+        ttl_weeks=patience,   # organic market TTL mirrors patience budget
         status="available",
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -76,13 +86,28 @@ def generate_project(client: Client, config: "Config", rng: random.Random) -> Pr
         )[0]
         min_skill = round(rng.uniform(0.3, 0.8), 2)
         headcount = rng.randint(1, config.max_headcount_per_role)
+
+        # Variable bill rate: what the client will pay for this role.
+        # Range: 1.3× to 2.0× the base salary depending on role scarcity & market.
+        # This is the MAXIMUM revenue the agency can earn — margin = bill_rate - hired_salary.
+        base = config.base_salaries.get(seniority, 85_000)
+        mult = config.role_multipliers.get(dev_type, 1.0)
+        # Scarcity premium: devops/ml_engineer commands higher bill rates
+        scarcity = {"ml_engineer": 1.15, "devops": 1.10, "backend": 1.05,
+                    "fullstack": 1.02, "frontend": 1.0}.get(dev_type, 1.0)
+        # Client willingness-to-pay: uniform draw [1.3×, 2.0×] of base×role×scarcity
+        client_premium = rng.uniform(1.30, 2.00)
+        bill_rate_annual = base * mult * scarcity * client_premium
+
         roles.append(Role(
             role_id=rid,
             developer_type=dev_type,
             seniority=seniority,
             min_skill_score=min_skill,
             headcount=headcount,
+            bill_rate_weekly=round(bill_rate_annual / 52, 2)
         ))
+
 
     return Project(
         project_id=pid,
@@ -262,14 +287,33 @@ def tick_contracts(
     return returning
 
 
+def tick_market_churn(market: list[Candidate], rng: random.Random) -> None:
+    """Organic churn: market candidates age out if not interviewed.
+
+    Each week uninterviewed, patience_remaining ticks down.  When it hits 0 the
+    candidate leaves — simulating real-world passivity (they get another offer,
+    lose interest, etc.).  This prevents the market from becoming a stale pool of
+    indefinitely available candidates, forcing the agent to act with urgency.
+    """
+    to_remove = []
+    for c in market:
+        c.patience_remaining -= 1
+        if c.patience_remaining <= 0:
+            to_remove.append(c)
+    for c in to_remove:
+        market.remove(c)
+
+
 def replenish_market(
     market: list[Candidate],
     config: "Config",
     rng: random.Random,
 ) -> None:
-    """Keep market pool up to max size."""
+    """Keep market pool up to max size, after ticking churn."""
+    tick_market_churn(market, rng)
     while len(market) < config.market_pool_size:
         market.append(generate_candidate(config, rng))
+
 
 
 # ---------------------------------------------------------------------------

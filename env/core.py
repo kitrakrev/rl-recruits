@@ -435,18 +435,23 @@ class StaffingCore:
         c.red_flags = result.red_flags
         c.interview_summary = result.summary
         c.status = "in_pipeline"
-        
+
+        # $500 interview cost: agency pays to screen each candidate
+        self.cash -= self.config.cost_per_interview
+        self.costs += self.config.cost_per_interview
+
         self.market.remove(c)
         self.candidates[c.id] = c
-        
+
         return {
-            "success": True, "reward": 0.0,
+            "success": True, "reward": -self.config.cost_per_interview,
             "candidate_id": c.id,
             "base_rating": result.base_rating,
             "proceed": result.proceed,
             "summary": result.summary,
             "red_flags": result.red_flags,
             "technical_score": result.technical_score,
+            "interview_cost": self.config.cost_per_interview,
             "result": {  # legacy RL wrapper
                 "base_rating": result.base_rating,
                 "proceed": result.proceed,
@@ -460,7 +465,7 @@ class StaffingCore:
         c = next((m for m in self.market if m.id == candidate_id), None)
         if not c:
             return {"success": False, "error": f"Candidate {candidate_id} not in market", "reward": 0.0}
-        
+
         job_desc = f"{c.developer_type} {c.seniority_level}"
         if c.seniority_level != "junior":
            job_desc += " role"
@@ -472,18 +477,23 @@ class StaffingCore:
         c.red_flags = result.red_flags
         c.interview_summary = result.summary
         c.status = "in_pipeline"
-        
+
+        # $500 interview cost
+        self.cash -= self.config.cost_per_interview
+        self.costs += self.config.cost_per_interview
+
         self.market.remove(c)
         self.candidates[c.id] = c
-        
+
         return {
-            "success": True, "reward": 0.0,
+            "success": True, "reward": -self.config.cost_per_interview,
             "candidate_id": c.id,
             "base_rating": result.base_rating,
             "proceed": result.proceed,
             "summary": result.summary,
             "red_flags": result.red_flags,
             "technical_score": result.technical_score,
+            "interview_cost": self.config.cost_per_interview,
             "result": {  # legacy RL wrapper
                 "base_rating": result.base_rating,
                 "proceed": result.proceed,
@@ -505,8 +515,16 @@ class StaffingCore:
 
         composite = round(0.4 * c.base_rating + 0.6 * 3.0, 2)
         c.composite_rating = composite
-        c.salary_weekly, c.client_rate_weekly = self.config.salary_from_rating(composite)
-        c.margin_weekly = c.client_rate_weekly - c.salary_weekly
+
+        # Dynamic salary: use the negotiated salary_expectation (set by negotiate_salary
+        # or generated at candidate creation).  This replaces the old static tier lookup.
+        # salary_weekly is what the agency PAYS; client_rate_weekly is what they CHARGE.
+        # margin_weekly = client_rate - salary (true consulting margin).
+        # At hire time we don't yet know the project's bill_rate, so we set a placeholder
+        # client_rate as salary × 1.25 (25% margin floor).  It gets overwritten at match.
+        c.salary_weekly = round(c.salary_expectation, 2)
+        c.client_rate_weekly = round(c.salary_weekly * 1.25, 2)   # floor estimate, overwritten at match
+        c.margin_weekly = round(c.client_rate_weekly - c.salary_weekly, 2)
         c.status = "hired"
         self.hire_step[c.id] = self.step_count
 
@@ -597,8 +615,14 @@ class StaffingCore:
 
         c.project_fit_rating = fit_result.project_fit_rating
         c.composite_rating = fit_result.composite_rating
-        c.salary_weekly, c.client_rate_weekly = self.config.salary_from_rating(c.composite_rating)
-        c.margin_weekly = c.client_rate_weekly - c.salary_weekly
+
+        # True consulting margin: client bill_rate - negotiated candidate salary.
+        # This forces the agent to chase high-bill-rate roles and negotiate cheap salaries.
+        # If bill_rate < salary, the placement LOSES money every week — a hard lesson.
+        c.client_rate_weekly = round(role.bill_rate_weekly, 2)
+        # salary_weekly was locked at hire (= salary_expectation at negotiation)
+        c.margin_weekly = round(c.client_rate_weekly - c.salary_weekly, 2)
+
         c.status = "placed"
         c.assigned_project = project_id
         c.assigned_role = role_id
@@ -615,18 +639,17 @@ class StaffingCore:
         if client:
             evt_type = "project_sealed" if sealed_now else ("adjacent_match" if match_score < 1.0 else "partial_fill")
             event = {"type": evt_type, "project_id": project_id, "match_score": match_score}
-            
+
             if self.env_type == "rl":
-                 event["fit_rating"] = fit_result.project_fit_rating
-                 
+                event["fit_rating"] = fit_result.project_fit_rating
+
             sat = self.llm.client_satisfaction(client, event, client.event_history)
             client.satisfaction_score = sat.new_score
             client.churn_risk = sat.churn_risk
             client.event_history.append(event)
             if sealed_now:
                 client.num_projects_filled += 1
-                total_hc = sum(r.headcount for r in project.roles)
-                project.weekly_revenue = client.contracted_rate * total_hc
+                project.weekly_revenue = sum(r.bill_rate_weekly for r in project.roles)
 
         if sealed_now and project.confirmed:
             original_deadline = self.config.t_deadline_max
@@ -647,6 +670,8 @@ class StaffingCore:
             "fit_rationale": fit_result.fit_rationale,
             "project_sealed": sealed_now,
             "weekly_margin": round(c.margin_weekly, 2),
+            "bill_rate_weekly": round(c.client_rate_weekly, 2),
+            "salary_weekly": round(c.salary_weekly, 2),
             "speed_bonus": round(reward * self.config.reward_scale if self.env_type == "mcp" else reward, 2),
             "risk_flags": getattr(fit_result, "risk_flags", []),
         }
@@ -671,8 +696,8 @@ class StaffingCore:
         match_score = compute_match_score(c, role, self.config)
         if match_score == 0.0:
             return {
-                "success": False, 
-                "error": "Illegal assignment \u2014 type mismatch or insufficient skill" if self.env_type=="mcp" else "Illegal assignment \u2014 skill or type mismatch", 
+                "success": False,
+                "error": "Illegal assignment \u2014 type mismatch or insufficient skill" if self.env_type=="mcp" else "Illegal assignment \u2014 skill or type mismatch",
                 "reward": 0.0,
                 "candidate_type": c.developer_type, "role_type": role.developer_type,
                 "candidate_skill": c.skill_score, "role_min_skill": role.min_skill_score
@@ -687,8 +712,11 @@ class StaffingCore:
 
         c.project_fit_rating = fit_result.project_fit_rating
         c.composite_rating = fit_result.composite_rating
-        c.salary_weekly, c.client_rate_weekly = self.config.salary_from_rating(c.composite_rating)
-        c.margin_weekly = c.client_rate_weekly - c.salary_weekly
+
+        # True consulting margin
+        c.client_rate_weekly = round(role.bill_rate_weekly, 2)
+        c.margin_weekly = round(c.client_rate_weekly - c.salary_weekly, 2)
+
         c.status = "placed"
         c.assigned_project = project_id
         c.assigned_role = role_id
@@ -705,18 +733,17 @@ class StaffingCore:
         if client:
             evt_type = "project_sealed" if sealed_now else ("adjacent_match" if match_score < 1.0 else "partial_fill")
             event = {"type": evt_type, "project_id": project_id, "match_score": match_score}
-            
+
             if self.env_type == "rl":
-                 event["fit_rating"] = fit_result.project_fit_rating
-                 
+                event["fit_rating"] = fit_result.project_fit_rating
+
             sat = await self.llm.async_client_satisfaction(client, event, client.event_history)
             client.satisfaction_score = sat.new_score
             client.churn_risk = sat.churn_risk
             client.event_history.append(event)
             if sealed_now:
                 client.num_projects_filled += 1
-                total_hc = sum(r.headcount for r in project.roles)
-                project.weekly_revenue = client.contracted_rate * total_hc
+                project.weekly_revenue = sum(r.bill_rate_weekly for r in project.roles)
 
         if sealed_now and project.confirmed:
             original_deadline = self.config.t_deadline_max
@@ -737,6 +764,8 @@ class StaffingCore:
             "fit_rationale": fit_result.fit_rationale,
             "project_sealed": sealed_now,
             "weekly_margin": round(c.margin_weekly, 2),
+            "bill_rate_weekly": round(c.client_rate_weekly, 2),
+            "salary_weekly": round(c.salary_weekly, 2),
             "speed_bonus": round(reward * self.config.reward_scale if self.env_type == "mcp" else reward, 2),
             "risk_flags": getattr(fit_result, "risk_flags", []),
         }

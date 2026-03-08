@@ -44,7 +44,9 @@ class Config:
     # --- Economics (from spec) ---
     onboarding_cost: float = 2_000.0
     severance_weeks: int = 2
-    margin_pct: float = 0.25           # client_rate = salary × 1.25
+    margin_pct: float = 0.25           # legacy, client_rate was salary × 1.25
+    cost_per_interview: float = 500.0
+
 
     # --- LLM ---
     llm_mode: Literal["stub", "live"] = "stub"
@@ -53,16 +55,8 @@ class Config:
         default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", "")
     )
 
-    # --- Rating tiers (composite_rating → weekly salary) ---
-    # Keyed by (lower_bound, upper_bound) — exclusive upper
-    rating_tiers: list = field(default_factory=lambda: [
-        # (lower, upper, label, annual_salary, annual_client_rate)
-        (1.0, 2.0, "Poor",          55_000,  68_750),
-        (2.0, 3.0, "Below Average", 70_000,  87_500),
-        (3.0, 4.0, "Average",       85_000, 106_250),
-        (4.0, 4.5, "Good",         105_000, 131_250),
-        (4.5, 5.1, "Excellent",    130_000, 162_500),
-    ])
+    # --- Legacy Rating tiers (to be removed once core.py is updated) ---
+    rating_tiers: list = field(default_factory=list)
 
     # --- Developer type adjacency ---
     adjacency: dict = field(default_factory=lambda: {
@@ -76,9 +70,16 @@ class Config:
     developer_types: list = field(default_factory=lambda: [
         "backend", "frontend", "fullstack", "ml_engineer", "devops"
     ])
+    base_salaries: dict = field(default_factory=lambda: {
+        "junior": 75_000, "mid": 110_000, "senior": 150_000
+    })
+    role_multipliers: dict = field(default_factory=lambda: {
+        "frontend": 1.0, "backend": 1.05, "fullstack": 1.1, "ml_engineer": 1.3, "devops": 1.15
+    })
     seniority_levels: list = field(default_factory=lambda: [
         "junior", "mid", "senior"
     ])
+
     industries: list = field(default_factory=lambda: [
         "fintech", "healthtech", "ecommerce", "saas", "logistics"
     ])
