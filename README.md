@@ -91,6 +91,23 @@ uv run python training/train_grpo.py --config training/config.yaml
 uv run python training/train_grpo.py --config training/config.yaml --num_episodes 100
 ```
 
+### Inference (no training, WandB logging)
+
+```bash
+# Terminal 1 — environment server
+uv run python -m uvicorn server.app:app --host 0.0.0.0 --port 8000
+
+# Terminal 2 — inference with base model
+uv run python training/infer.py --no_adapter --num_episodes 5
+
+# With LoRA checkpoint + WandB
+uv run python training/infer.py \
+    --checkpoint training/checkpoints \
+    --num_episodes 10 \
+    --wandb \
+    --wandb_project myorg/staffing-agent
+```
+
 ---
 
 ## Config API (live hot-patch)

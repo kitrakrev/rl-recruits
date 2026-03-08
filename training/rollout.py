@@ -300,7 +300,10 @@ def rollout_full_episode(
     print(f"\n      --- Rollout Phase (Seed {seed}) ---")
 
     prev_profit = final_profit
+    episode_done = False
     for week in range(1, 53):
+        if episode_done:
+            break
         week_advanced = False
         parse_fail_streak = 0
 
@@ -382,6 +385,8 @@ def rollout_full_episode(
 
                     if tool_name == "advance_week":
                         week_advanced = True
+                    if result.done:
+                        episode_done = True
                 except Exception as e:
                     tool_result_text = f"Error: {e}"
                     print(f"  W{week:02d}T{turn:02d} {tool_name:25s} ! ERROR: {e}")
@@ -396,7 +401,7 @@ def rollout_full_episode(
             step_rewards.append(reward)
             cumulative_env_reward += reward
 
-            if week_advanced:
+            if week_advanced or episode_done:
                 break
 
             # ---- Build next conversation turn --------------------------------
@@ -462,12 +467,17 @@ def rollout_full_episode(
                 result = env.step(StaffingAction(tool="advance_week", params={}))
                 final_profit = float(result.observation.profit or 0.0)
                 prev_profit = final_profit  # sync so next week's ΔP is clean
+                if result.done:
+                    episode_done = True
                 # Reward is intentionally 0 — auto-advance is not a model action.
                 step_rewards.append(0.0)
                 prompts_out.append("")        # placeholder — no model output for auto-advance
                 completions_out.append("")
             except Exception:
                 pass
+
+        if episode_done:
+            break
 
         # Trim history and inject fresh state for next week
         system_msg = conversation[0]
