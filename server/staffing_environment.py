@@ -9,6 +9,15 @@ Implements the OpenEnv contract:
 
 Theme: Multi-Agent Interactions + Long-Horizon Planning (Scale AI / Mercor sub-theme)
 Agent must manage a multi-actor system (candidates + clients) over a 52-step horizon.
+
+Reward flow (IMPORTANT):
+  MCPEnvironment.step() executes the MCP tool and returns a CallToolObservation
+  whose .reward is always 0 — the framework does NOT extract reward from the tool
+  result dict. Instead, each registered tool wrapper stores the reward it computed
+  in env._last_tool_reward immediately before stripping it from the dict sent to
+  the agent. staffing_environment.step() then reads _last_tool_reward to build the
+  true total_reward. This keeps reward signal out of the agent's conversation while
+  still propagating it correctly to the training loop.
 """
 from __future__ import annotations
 
@@ -52,9 +61,6 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         "get_project_details", "get_candidate_profile",
         "get_market_demand", "get_financial_summary",
     })
-    _PASSIVE_STREAK_PENALTY = -50.0   # $ per consecutive passive-only turn above threshold
-    _PASSIVE_STREAK_THRESHOLD = 3     # free passive turns before penalty kicks in
-    _REPEAT_CALL_PENALTY = -100.0     # penalty for calling the exact same tool twice in a row
 
     def __init__(self, config: Config | None = None):
         self._config = config or Config(
@@ -67,6 +73,11 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         self._state = StaffingState()
         self._passive_streak: int = 0   # consecutive GET-only turns this episode
         self._last_tool: str = ""        # last tool called, for repeat detection
+
+        # Reward capture: each MCP tool wrapper stores its reward here before
+        # stripping the "reward" key from the dict it returns to the agent.
+        # step() reads this after super().step() executes the tool.
+        self._last_tool_reward: float = 0.0
 
         import random
         self._rng = random.Random()
@@ -83,6 +94,7 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         self.core.reset(seed)
         self._passive_streak = 0
         self._last_tool = ""
+        self._last_tool_reward = 0.0
         episode_id = episode_id or str(uuid4())
         self._state = StaffingState(
             episode_id=episode_id,
@@ -93,7 +105,7 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             done=False,
         )
         snap = self._snapshot()
-        
+
         return StaffingObservation(
             done=False,
             reward=0.0,
@@ -115,21 +127,27 @@ class StaffingAgencyEnvironment(MCPEnvironment):
     })
 
     def step(self, action: Any, timeout_s: float | None = None, **kwargs) -> Observation:
-        """Route MCP tool calls + run world tick.
+        """Route MCP tool calls + capture rewards.
 
         ListToolsAction → pass through raw ListToolsObservation (no tick).
         GET CallToolAction → run tool only, no tick (pure observation).
-        EXECUTE CallToolAction → run tool + world tick + step increment.
+        EXECUTE CallToolAction → run tool + step increment (via advance_week).
+
+        REWARD FLOW:
+          MCPEnvironment.step() returns obs.reward == 0 always (framework
+          does not extract reward from tool result dicts). Each tool wrapper
+          stores its raw reward in self._last_tool_reward before stripping
+          the "reward" key so the agent cannot see it. We read that stored
+          value here and add penalties to form total_reward.
         """
-        # Tool discovery: no tick
+        # Tool discovery: no tick, no reward
         if isinstance(action, ListToolsAction):
             return super().step(action, timeout_s=timeout_s, **kwargs)
 
-        # EXECUTE CallToolAction → No longer automatically ticks world.
-        # Step increment and world_tick are now handled by 'advance_week' tool.
-        pass
+        # Reset per-step reward accumulator before the tool runs
+        self._last_tool_reward = 0.0
 
-        # Let MCPEnvironment route EXECUTE CallToolAction
+        # Let MCPEnvironment route and execute the tool call
         obs = super().step(action, timeout_s=timeout_s, **kwargs)
 
         # Sync state with core after action (tool might have changed cash/etc)
@@ -137,12 +155,15 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         self._state.cash = self.core.cash
         self._state.revenue = self.core.revenue
         self._state.costs = self.core.costs
-        
+
+        # Capture the tool's own reward (set by each wrapper into _last_tool_reward)
+        tool_reward = self._last_tool_reward
+
         # Repeat-call penalty: penalize calling the same tool twice in a row
         tool_name = action.tool_name if hasattr(action, "tool_name") else ""
         repeat_penalty = 0.0
-        if tool_name and tool_name == self._last_tool:
-            repeat_penalty = self._REPEAT_CALL_PENALTY
+        if tool_name and tool_name == self._last_tool and tool_name not in self._GET_TOOLS:
+            repeat_penalty = self._config.repeat_call_penalty
             self.core.costs += abs(repeat_penalty)
         self._last_tool = tool_name
 
@@ -150,20 +171,19 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         if tool_name in self._PASSIVE_TOOLS:
             self._passive_streak += 1
         else:
-            self._passive_streak = 0  # reset on any active action
+            self._passive_streak = 0
 
         passive_penalty = 0.0
-        if self._passive_streak > self._PASSIVE_STREAK_THRESHOLD:
-            passive_penalty = self._PASSIVE_STREAK_PENALTY
-            self.core.costs += abs(passive_penalty)  # reflect in financials
+        if self._passive_streak > self._config.passive_streak_threshold:
+            passive_penalty = self._config.passive_streak_penalty
+            self.core.costs += abs(passive_penalty)
 
-        # Re-sync costs after penalties (penalties mutate core.costs above)
+        # Re-sync costs after penalties
         self._state.costs = self.core.costs
 
-        # Reward is now primarily tool-based OR tick-based (if tool was advance_week)
-        total_reward = (obs.reward or 0.0) + passive_penalty + repeat_penalty
+        total_reward = tool_reward + passive_penalty + repeat_penalty
         self._state.cumulative_reward += total_reward
-        
+
         done = (
             self._state.cash < 0
             or self._state.step_count >= self._config.episode_steps
@@ -175,7 +195,7 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         active = [cl for cl in self.core.clients if not cl.churn_risk]
         self._state.avg_satisfaction = sum(cl.satisfaction_score for cl in active) / len(active) if active else 0.0
 
-        # Unwrap CallToolObservation → plain dict
+        # Unwrap CallToolObservation → plain dict (strip reward key so agent never sees it)
         tool_result = None
         if hasattr(obs, "result") and obs.result is not None:
             r = obs.result
@@ -187,6 +207,10 @@ class StaffingAgencyEnvironment(MCPEnvironment):
                 tool_result = r
         elif hasattr(obs, "metadata"):
             tool_result = obs.metadata
+
+        # Ensure reward never leaks into agent-visible tool_result
+        if isinstance(tool_result, dict):
+            tool_result.pop("reward", None)
 
         return CallToolObservation(
             tool_name=action.tool_name,
@@ -221,19 +245,23 @@ class StaffingAgencyEnvironment(MCPEnvironment):
     def _register_tools(self, mcp: FastMCP) -> None:
         env = self
 
-        @mcp.tool()
-        def get_agency_state() -> dict: return env.core.tool_get_agency_state()["state"]
+        # ---- GET tools (reward always 0, no state mutation) ----
 
         @mcp.tool()
-        def get_client_state(client_id: str = "") -> dict: 
+        def get_agency_state() -> dict:
+            return env.core.tool_get_agency_state()["state"]
+
+        @mcp.tool()
+        def get_client_state(client_id: str = "") -> dict:
             res = env.core.tool_get_client_state(client_id)
-            if "error" in res: return res
+            if "error" in res:
+                return res
             if isinstance(res.get("state"), list):
                 return {"clients": res["state"]}
             return res.get("state") or res
 
         @mcp.tool()
-        def get_candidate_state() -> dict: 
+        def get_candidate_state() -> dict:
             res = env.core.tool_get_candidate_state()
             res.pop("reward", None)
             res.pop("success", None)
@@ -243,84 +271,113 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         @mcp.tool()
         def get_project_details(project_id: str) -> dict:
             res = env.core.tool_get_project_details(project_id)
-            if "error" in res: return {"error": res["error"]}
+            if "error" in res:
+                return {"error": res["error"]}
             return dict(res["project"])
 
         @mcp.tool()
         def get_candidate_profile(candidate_id: str) -> dict:
             res = env.core.tool_get_candidate_profile(candidate_id)
-            if "error" in res: return {"error": res["error"]}
+            if "error" in res:
+                return {"error": res["error"]}
             return dict(res["candidate"])
 
         @mcp.tool()
-        def get_market_demand() -> dict: return {"demand_by_type": env.core.tool_get_market_demand()["demand_by_type"], "total_open_slots": env.core.tool_get_market_demand()["total_open_slots"]}
+        def get_market_demand() -> dict:
+            r = env.core.tool_get_market_demand()
+            return {"demand_by_type": r["demand_by_type"], "total_open_slots": r["total_open_slots"]}
 
         @mcp.tool()
-        def get_financial_summary() -> dict: return env.core.tool_get_financial_summary()["summary"]
+        def get_financial_summary() -> dict:
+            return env.core.tool_get_financial_summary()["summary"]
+
+        # ---- EXECUTE tools — capture reward before stripping ----
 
         @mcp.tool()
         def find_available_projects() -> dict:
             r = env.core.tool_find_available_projects()
+            # reward=0 for pure read
             return {"projects": r["projects"], "count": r["count"]}
 
         @mcp.tool()
-        def confirm_project(project_id: str) -> dict: 
+        def confirm_project(project_id: str) -> dict:
             res = env.core.tool_confirm_project(project_id)
-            if "reward" in res: res.pop("reward")
+            env._last_tool_reward = float(res.pop("reward", 0.0))
             return res
 
         @mcp.tool()
-        def find_candidate(developer_type: str = "") -> dict: 
+        def find_candidate(developer_type: str = "") -> dict:
             r = env.core.tool_find_candidate(developer_type)
             return {"candidates": r["candidates"], "count": r["count"]}
 
         @mcp.tool()
-        def interview_candidate(candidate_id: str) -> dict: 
+        def interview_candidate(candidate_id: str) -> dict:
+            """Screen a candidate: costs $500, reveals skill + salary expectation."""
             res = env.core.tool_interview_candidate(candidate_id)
-            if "reward" in res: res.pop("reward")
-            if "result" in res: res.pop("result")
+            # REWARD FIX: capture -$500 interview cost before stripping from agent view
+            env._last_tool_reward = float(res.pop("reward", 0.0))
+            res.pop("result", None)   # legacy RL wrapper field
             return res
 
         @mcp.tool()
-        def hire_candidate(candidate_id: str) -> dict: 
+        def hire_candidate(candidate_id: str) -> dict:
+            """Hire an interviewed candidate: costs $2,000 onboarding."""
             res = env.core.tool_hire_candidate(candidate_id)
-            if "reward" in res: res.pop("reward")
+            # REWARD FIX: capture -$2,000 onboarding cost
+            env._last_tool_reward = float(res.pop("reward", 0.0))
             return res
 
         @mcp.tool()
-        def negotiate_salary(candidate_id: str, offer_weekly: float) -> dict: 
+        def negotiate_salary(candidate_id: str, offer_weekly: float) -> dict:
             res = env.core.tool_negotiate_salary(candidate_id, offer_weekly)
-            if "reward" in res: res.pop("reward")
+            env._last_tool_reward = float(res.pop("reward", 0.0))
             return res
 
         @mcp.tool()
-        def match_candidate_to_project(candidate_id: str, project_id: str, role_id: str) -> dict: 
+        def match_candidate_to_project(candidate_id: str, project_id: str, role_id: str) -> dict:
+            """Place a candidate on a role. Speed bonus if project sealed within 2 weeks."""
             res = env.core.tool_match_candidate_to_project(candidate_id, project_id, role_id)
-            if "reward" in res: res.pop("reward")
+            # REWARD FIX: capture speed-seal bonus (0 for most placements, small bonus for fast seals)
+            env._last_tool_reward = float(res.pop("reward", 0.0))
             return res
 
         @mcp.tool()
-        def let_go_candidate(candidate_id: str) -> dict: 
+        def let_go_candidate(candidate_id: str) -> dict:
+            """Release a candidate: costs 2× weekly salary as severance."""
             res = env.core.tool_let_go_candidate(candidate_id)
-            if "reward" in res: res.pop("reward")
+            # REWARD FIX: capture -severance cost
+            env._last_tool_reward = float(res.pop("reward", 0.0))
             return res
 
         @mcp.tool()
-        def request_project_extension(project_id: str) -> dict: 
+        def request_project_extension(project_id: str) -> dict:
             res = env.core.tool_request_project_extension(project_id)
-            if "reward" in res: res.pop("reward")
+            env._last_tool_reward = float(res.pop("reward", 0.0))
             return res
 
         @mcp.tool()
-        def pass_on_project(project_id: str) -> dict: 
+        def pass_on_project(project_id: str) -> dict:
             res = env.core.tool_pass_on_project(project_id)
-            if "reward" in res: res.pop("reward")
+            env._last_tool_reward = float(res.pop("reward", 0.0))
             return res
 
         @mcp.tool()
         def advance_week() -> dict:
-            """Advance simulation to the next week (ticks world, pays costs/revenue)."""
-            return env.core.tool_advance_week()
+            """Advance simulation to the next week (ticks world, pays costs/revenue).
+
+            This is where the major reward signal arrives:
+              +margin_weekly per placed candidate
+              -salary_weekly per benched candidate
+              -expiry_penalty per expired unfilled project role
+              -client_ltv_estimate if client satisfaction < churn_threshold
+            """
+            res = env.core.tool_advance_week()
+            # REWARD FIX: capture world_tick reward (billing margins, bench burn,
+            # expiry penalties, churn penalties) before stripping from agent view.
+            env._last_tool_reward = float(res.pop("reward", 0.0))
+            return res
+
+        # ---- Admin / UI-only tools (no episode reward) ----
 
         @mcp.tool()
         def _override_cash(amount: float) -> dict:
@@ -332,11 +389,18 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         @mcp.tool()
         def _override_satisfaction(client_id: str, score: float) -> dict:
             client = next((c for c in env.core.clients if c.client_id == client_id), None)
-            if not client: return {"success": False, "error": f"Client {client_id} not found"}
+            if not client:
+                return {"success": False, "error": f"Client {client_id} not found"}
             old = client.satisfaction_score
             client.satisfaction_score = max(0.0, min(1.0, float(score)))
             client.churn_risk = client.satisfaction_score < env._config.churn_threshold
-            return {"success": True, "client_id": client_id, "old_score": round(old, 3), "new_score": round(client.satisfaction_score, 3), "churn_risk": client.churn_risk}
+            return {
+                "success": True,
+                "client_id": client_id,
+                "old_score": round(old, 3),
+                "new_score": round(client.satisfaction_score, 3),
+                "churn_risk": client.churn_risk,
+            }
 
     # ------------------------------------------------------------------
     # Helpers

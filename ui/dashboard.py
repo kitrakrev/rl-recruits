@@ -165,11 +165,12 @@ def fetch_full_state() -> dict:
 
     # Append to history
     a = state["agency"]
+    ctx = state.get("_ctx", {})
     if a:
         _history["steps"].append(a.get("step", 0))
         _history["cash"].append(a.get("cash_balance", 0))
         _history["profit"].append(a.get("current_profit", 0))
-        _history["reward"].append(a.get("current_profit", 0) / 1000)
+        _history["reward"].append(ctx.get("cumulative_reward", 0.0))
         _history["burn_rate"].append(a.get("burn_rate", 0))
         _history["placed"].append(a.get("num_candidates_placed", 0))
         _history["hired"].append(a.get("num_candidates_hired", 0))

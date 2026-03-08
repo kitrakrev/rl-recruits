@@ -1,10 +1,17 @@
 """
-All tunable parameters for the Staffing Agency RL environment.
-Override via environment variables or pass a Config object to StaffingEnv.
+All tunable parameters for the Staffing Agency RL environment and training loop.
+
+Environment config  → Config (passed to StaffingAgencyEnvironment)
+Training config     → TrainingConfig (used by training/reinforce.py)
+
+Both can be overridden via:
+  - Constructor args
+  - YAML file (TrainingConfig.from_yaml / Config.from_yaml)
+  - PATCH /config/env API endpoint (env config only, live reload)
 """
 import os
-from dataclasses import dataclass, field
-from typing import Literal
+from dataclasses import dataclass, field, fields as dc_fields
+from typing import Literal, Any
 
 
 @dataclass
@@ -47,6 +54,12 @@ class Config:
     margin_pct: float = 0.25           # legacy, client_rate was salary × 1.25
     cost_per_interview: float = 500.0
 
+
+    # --- Server behaviour penalties ---
+    # These are subtracted from total_reward in staffing_environment.step().
+    passive_streak_penalty: float = -50.0    # $ per turn after threshold consecutive GET calls
+    passive_streak_threshold: int = 3        # free GET-only turns before penalty kicks in
+    repeat_call_penalty: float = -100.0      # $ penalty for calling the same tool twice in a row
 
     # --- LLM ---
     llm_mode: Literal["stub", "live"] = "stub"
@@ -93,3 +106,106 @@ class Config:
         # fallback to highest tier
         _, _, _, annual_salary, annual_client = self.rating_tiers[-1]
         return annual_salary / 52, annual_client / 52
+
+    def to_dict(self) -> dict:
+        """Serialise to plain dict (for /config/env API response)."""
+        out: dict = {}
+        for f in dc_fields(self):
+            v = getattr(self, f.name)
+            out[f.name] = list(v) if isinstance(v, set) else v
+        return out
+
+    def update(self, updates: dict[str, Any]) -> list[str]:
+        """Apply a partial update dict. Returns list of keys that were changed."""
+        changed: list[str] = []
+        field_types = {f.name: f.type for f in dc_fields(self)}
+        for key, value in updates.items():
+            if not hasattr(self, key):
+                continue
+            try:
+                current = getattr(self, key)
+                # Coerce to existing type where safe
+                if isinstance(current, bool):
+                    value = bool(value)
+                elif isinstance(current, int):
+                    value = int(value)
+                elif isinstance(current, float):
+                    value = float(value)
+                setattr(self, key, value)
+                changed.append(key)
+            except (TypeError, ValueError):
+                pass
+        return changed
+
+
+# ---------------------------------------------------------------------------
+# Training hyperparameters
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TrainingConfig:
+    """
+    All hyperparameters for the REINFORCE-GRPO training loop.
+
+    Configurable via:
+      - Constructor:  TrainingConfig(learning_rate=1e-5)
+      - YAML file:    TrainingConfig.from_yaml("training/config.yaml")
+      - CLI args:     TrainingConfig.from_args(parsed_args)
+    """
+
+    # --- Model ---
+    # Qwen2.5-7B-Instruct: native <tool_call> JSON format, best-in-class tool use,
+    # ~14GB bfloat16 (×2 with ref model = 28GB — fits H100 80GB comfortably).
+    model_name: str = "Qwen/Qwen2.5-7B-Instruct"
+
+    # --- Optimisation ---
+    learning_rate: float = 5e-6
+    gamma: float = 0.99          # discount factor for returns
+    kl_coeff: float = 0.05       # KL penalty weight (prevents divergence from base model)
+    train_batch_size: int = 4    # steps per gradient accumulation batch
+    max_grad_norm: float = 1.0   # gradient clipping threshold
+
+    # --- Generation ---
+    max_turns_per_step: int = 10  # max tool calls per episode-week before forced advance
+    max_prompt_len: int = 2048    # tokenisation truncation for prompt
+    max_full_len: int = 2560      # tokenisation truncation for prompt+completion
+    max_new_tokens: int = 512     # model generation budget per turn
+    temperature: float = 0.8      # sampling temperature
+
+    # --- Experiment ---
+    num_episodes: int = 200
+    seed: int = 42
+    output_dir: str = "training/checkpoints"
+    env_url: str = "http://localhost:8000"
+
+    # --- W&B ---
+    wandb_project: str = "kanandan-university-of-california/Staffing_agent"
+    wandb_api_key: str = field(default_factory=lambda: os.getenv("WANDB_API_KEY", ""))
+
+    # --- Dry-run ---
+    dry_run: bool = False
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "TrainingConfig":
+        """Load from a YAML file (only keys that exist on the dataclass are used)."""
+        try:
+            import yaml
+        except ImportError:
+            raise ImportError("PyYAML required: uv pip install pyyaml")
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        valid = {f.name for f in dc_fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in valid})
+
+    @classmethod
+    def from_args(cls, args: Any) -> "TrainingConfig":
+        """Build from an argparse Namespace, overriding only non-None fields."""
+        cfg = cls()
+        for f in dc_fields(cfg):
+            val = getattr(args, f.name, None)
+            if val is not None:
+                setattr(cfg, f.name, val)
+        return cfg
+
+    def to_dict(self) -> dict:
+        return {f.name: getattr(self, f.name) for f in dc_fields(self)}
