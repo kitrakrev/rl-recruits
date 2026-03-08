@@ -20,6 +20,204 @@ if TYPE_CHECKING:
     from training.config import TrainingConfig
 
 
+def _build_actionable_state(env, week: int) -> str:
+    """Build a compact, actionable state string with concrete IDs the model can use.
+
+    The key insight: the small model can't figure out type-matching on its own.
+    We pre-compute valid (candidate, role) pairs and present them as ready-to-use
+    commands so the model just needs to pick one and execute the pipeline.
+    """
+    from models import StaffingAction
+
+    # Type adjacency (must match env/config.py)
+    ADJACENCY = {
+        "backend":     {"backend", "fullstack", "ml_engineer"},
+        "frontend":    {"frontend", "fullstack"},
+        "fullstack":   {"fullstack", "backend", "frontend"},
+        "ml_engineer": {"ml_engineer", "backend"},
+        "devops":      {"devops"},
+    }
+    SEN_ORDER = {"junior": 0, "mid": 1, "senior": 2}
+
+    lines: list[str] = [f"[Week {week} of 52]"]
+
+    # --- Open projects with unfilled roles ---
+    try:
+        r = env.step(StaffingAction(tool="find_available_projects", params={}))
+        projects = (r.observation.tool_result or {}).get("projects", [])
+    except Exception:
+        projects = []
+
+    # Flatten to list of unfilled roles with their project context
+    open_roles: list[dict] = []
+    for p in projects[:6]:
+        pid = p["project_id"]
+        deadline = p.get("deadline_remaining", "?")
+        for role in p.get("roles", []):
+            if role.get("is_filled"):
+                continue
+            open_roles.append({
+                "project_id": pid,
+                "role_id": role["role_id"],
+                "developer_type": role.get("developer_type", "?"),
+                "seniority": role.get("seniority", "junior"),
+                "bill_rate_weekly": role.get("bill_rate_weekly", 0),
+                "deadline": deadline,
+            })
+
+    # --- Your candidates ---
+    try:
+        r = env.step(StaffingAction(tool="get_candidate_state", params={}))
+        cstate = r.observation.tool_result or {}
+    except Exception:
+        cstate = {}
+
+    all_cands = cstate.get("candidates", [])
+    hired = [c for c in all_cands if c.get("status") == "hired"]
+    pipeline = [c for c in all_cands if c.get("status") == "in_pipeline"]
+    placed = [c for c in all_cands if c.get("status") == "placed"]
+
+    # --- Market candidates ---
+    try:
+        r = env.step(StaffingAction(tool="find_candidate", params={}))
+        market = (r.observation.tool_result or {}).get("candidates", [])
+    except Exception:
+        market = []
+
+    # ================================================================
+    # SECTION 1: READY-TO-EXECUTE MATCHES (hired candidate ↔ open role)
+    # ================================================================
+    ready_matches: list[str] = []
+    used_hired: set[str] = set()
+    used_roles: set[str] = set()
+
+    for role in open_roles:
+        for c in hired:
+            cid = c["id"]
+            if cid in used_hired:
+                continue
+            ctype = c.get("developer_type", "?")
+            csen = c.get("seniority_level", "junior")
+            rtype = role["developer_type"]
+            rsen = role["seniority"]
+            # Check adjacency
+            if rtype not in ADJACENCY.get(ctype, set()):
+                continue
+            # Check seniority
+            if SEN_ORDER.get(csen, 0) < SEN_ORDER.get(rsen, 0):
+                continue
+            salary = c.get("salary_weekly", 0)
+            bill = role["bill_rate_weekly"]
+            margin = bill - salary
+            if margin <= 0:
+                continue  # would lose money
+            ready_matches.append(
+                f'  → match_candidate_to_project(candidate_id="{cid}", '
+                f'project_id="{role["project_id"]}", role_id="{role["role_id"]}")'
+                f"  margin=${margin:,.0f}/wk"
+            )
+            used_hired.add(cid)
+            used_roles.add(role["role_id"])
+            break  # one candidate per role
+
+    if ready_matches:
+        lines.append("\n★ READY-TO-EXECUTE MATCHES (call these NOW, then advance_week):")
+        lines.extend(ready_matches)
+
+    # ================================================================
+    # SECTION 2: PIPELINE CANDIDATES → hire then match
+    # ================================================================
+    pipeline_actions: list[str] = []
+    for c in pipeline[:4]:
+        cid = c["id"]
+        ctype = c.get("developer_type", "?")
+        csen = c.get("seniority_level", "junior")
+        salary_exp = c.get("salary_expectation", 0)
+        # Find a compatible open role
+        for role in open_roles:
+            if role["role_id"] in used_roles:
+                continue
+            rtype = role["developer_type"]
+            rsen = role["seniority"]
+            if rtype not in ADJACENCY.get(ctype, set()):
+                continue
+            if SEN_ORDER.get(csen, 0) < SEN_ORDER.get(rsen, 0):
+                continue
+            margin = role["bill_rate_weekly"] - salary_exp
+            if margin <= 0:
+                continue
+            pipeline_actions.append(
+                f'  → hire_candidate(candidate_id="{cid}") then '
+                f'match_candidate_to_project(candidate_id="{cid}", '
+                f'project_id="{role["project_id"]}", role_id="{role["role_id"]}")'
+                f"  est_margin=${margin:,.0f}/wk"
+            )
+            break
+
+    if pipeline_actions:
+        lines.append("\n★ HIRE THEN MATCH (call hire_candidate first, then match):")
+        lines.extend(pipeline_actions)
+
+    # ================================================================
+    # SECTION 3: MARKET → interview → hire → match
+    # ================================================================
+    # Find market candidates whose type matches an open role
+    needed_types: set[str] = set()
+    for role in open_roles:
+        if role["role_id"] not in used_roles:
+            needed_types.add(role["developer_type"])
+            # Also add adjacent types that can fill this role
+            for ctype, adj in ADJACENCY.items():
+                if role["developer_type"] in adj:
+                    needed_types.add(ctype)
+
+    market_actions: list[str] = []
+    for c in market[:6]:
+        ctype = c.get("developer_type", "?")
+        if ctype not in needed_types and needed_types:
+            continue
+        cid = c["id"]
+        csen = c.get("seniority_level", "junior")
+        salary_exp = c.get("salary_expectation", 0)
+        market_actions.append(
+            f'  → interview_candidate(candidate_id="{cid}")  '
+            f"{ctype} {csen}  salary_exp=${salary_exp:,.0f}/wk"
+        )
+        if len(market_actions) >= 3:
+            break
+
+    if market_actions:
+        lines.append("\n★ INTERVIEW THESE (matching types for open roles):")
+        lines.extend(market_actions)
+    elif not ready_matches and not pipeline_actions:
+        # Nothing useful to do — just show any market candidate
+        if market:
+            c = market[0]
+            lines.append(
+                f'\nNo matching candidates. Interview anyway: '
+                f'interview_candidate(candidate_id="{c["id"]}")'
+            )
+
+    # ================================================================
+    # SECTION 4: Summary + what to do
+    # ================================================================
+    if placed:
+        lines.append(f"\nPLACED (earning revenue): {len(placed)} candidates")
+
+    if not open_roles:
+        lines.append("\nNo open projects. Call advance_week to get new projects.")
+    elif ready_matches:
+        lines.append("\nDO NOW: Execute the ★ matches above, then call advance_week.")
+    elif pipeline_actions:
+        lines.append("\nDO NOW: Hire the pipeline candidates above, match them, then advance_week.")
+    elif market_actions:
+        lines.append("\nDO NOW: Interview a candidate above, hire, match to a role, then advance_week.")
+    else:
+        lines.append("\nNo viable candidates for open roles. Call advance_week.")
+
+    return "\n".join(lines)
+
+
 def _strip_think(text: str) -> str:
     """Remove Qwen3 <think>...</think> reasoning blocks from generated text."""
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
@@ -88,33 +286,15 @@ def rollout_full_episode(
     final_profit = 0.0
 
     # Seed Week 1: give the model real IDs so it can act immediately.
-    init_state: dict = {}
-    try:
-        r = env.step(StaffingAction(tool="get_financial_summary", params={}))
-        init_state["financials"] = r.observation.tool_result or {}
-        final_profit = float(r.observation.profit or 0.0)
-    except Exception:
-        pass
-    try:
-        r = env.step(StaffingAction(tool="get_candidate_state", params={}))
-        init_state["candidates"] = r.observation.tool_result or {}
-    except Exception:
-        pass
-    try:
-        r = env.step(StaffingAction(tool="get_client_state", params={}))
-        init_state["clients"] = r.observation.tool_result or {}
-    except Exception:
-        pass
+    state_text = _build_actionable_state(env, 1)
+    final_profit = float(
+        env.step(StaffingAction(tool="get_financial_summary", params={}))
+        .observation.profit or 0.0
+    )
 
-    init_str = json.dumps(init_state, indent=2)[:1200]
     conversation = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": (
-            f"Week 1 of 52. Current state:\n{init_str}\n\n"
-            "Take business actions. Find candidates, interview them, hire the best ones, "
-            "confirm projects, and match candidates to project roles to generate profit. "
-            "Call advance_week when done."
-        )},
+        {"role": "user", "content": state_text},
     ]
 
     print(f"\n      --- Rollout Phase (Seed {seed}) ---")
@@ -273,15 +453,17 @@ def rollout_full_episode(
                     ),
                 })
 
-        # Auto-advance if model never called advance_week
+        # Auto-advance if model never called advance_week.
+        # This is a safety valve — NOT a model decision.  Zero reward so
+        # the model can't earn billing revenue by wasting all 10 turns.
         if not week_advanced:
             print(f"  W{week:02d}   [auto-advance — max turns reached]")
             try:
                 result = env.step(StaffingAction(tool="advance_week", params={}))
                 final_profit = float(result.observation.profit or 0.0)
-                auto_reward = float(result.reward or 0.0)
-                step_rewards.append(auto_reward)
-                cumulative_env_reward += auto_reward
+                prev_profit = final_profit  # sync so next week's ΔP is clean
+                # Reward is intentionally 0 — auto-advance is not a model action.
+                step_rewards.append(0.0)
                 prompts_out.append("")        # placeholder — no model output for auto-advance
                 completions_out.append("")
             except Exception:
@@ -291,25 +473,10 @@ def rollout_full_episode(
         system_msg = conversation[0]
         recent = conversation[-6:] if len(conversation) > 7 else conversation[1:]
 
-        week_state: dict = {}
-        try:
-            r = env.step(StaffingAction(tool="get_candidate_state", params={}))
-            week_state["candidates"] = r.observation.tool_result or {}
-        except Exception:
-            pass
-        try:
-            r = env.step(StaffingAction(tool="get_client_state", params={}))
-            week_state["clients"] = r.observation.tool_result or {}
-        except Exception:
-            pass
-
-        state_str = json.dumps(week_state, indent=2)[:1000]
+        state_text = _build_actionable_state(env, week + 1)
         conversation = [system_msg] + recent + [{
             "role": "user",
-            "content": (
-                f"[Week {week + 1} of 52 — current state]\n{state_str}\n\n"
-                "Continue: hire candidates, fill project roles, then call advance_week."
-            ),
+            "content": state_text,
         }]
 
     print(f"  --- Episode done: profit=${final_profit:,.0f}  total_reward={cumulative_env_reward:+,.2f} ---")

@@ -634,7 +634,11 @@ class StaffingCore:
         project.update_fill_status()
 
         sealed_now = project.fill_status == "SEALED"
-        reward = 0.0
+
+        # Immediate placement reward: give agent clear positive signal for a successful match.
+        # Positive-margin placements get an immediate bonus (1 week of margin).
+        # Negative-margin placements get 0 here (the loss shows at advance_week).
+        reward = max(c.margin_weekly, 0.0)
 
         if client:
             evt_type = "project_sealed" if sealed_now else ("adjacent_match" if match_score < 1.0 else "partial_fill")
@@ -728,7 +732,9 @@ class StaffingCore:
         project.update_fill_status()
 
         sealed_now = project.fill_status == "SEALED"
-        reward = 0.0
+
+        # Immediate placement reward (same as sync version)
+        reward = max(c.margin_weekly, 0.0)
 
         if client:
             evt_type = "project_sealed" if sealed_now else ("adjacent_match" if match_score < 1.0 else "partial_fill")

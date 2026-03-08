@@ -169,6 +169,7 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         "get_agency_state", "get_client_state", "get_candidate_state",
         "get_project_details", "get_candidate_profile",
         "get_market_demand", "get_financial_summary",
+        "find_candidate", "find_available_projects",  # read-only lookups
         "_override_cash", "_override_satisfaction",
     })
 
@@ -219,8 +220,19 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         # Capture the tool's own reward (set by each wrapper into _last_tool_reward)
         tool_reward = self._last_tool_reward
 
-        # Repeat-call penalty: penalize calling the same tool twice in a row
+        # Invalid-action penalty: if an execute-tool call failed (success=False),
+        # apply a small negative reward so the model learns to avoid bad calls.
         tool_name = action.tool_name if hasattr(action, "tool_name") else ""
+        invalid_penalty = 0.0
+        if tool_name not in self._GET_TOOLS and tool_name not in self._PASSIVE_TOOLS:
+            # Check if tool result indicates failure
+            if hasattr(obs, "result") and obs.result is not None:
+                r = obs.result
+                result_data = r.data if hasattr(r, "data") else (r if isinstance(r, dict) else {})
+                if isinstance(result_data, dict) and result_data.get("success") is False:
+                    invalid_penalty = self._config.invalid_action_penalty
+
+        # Repeat-call penalty: penalize calling the same tool twice in a row
         repeat_penalty = 0.0
         if tool_name and tool_name == self._last_tool and tool_name not in self._GET_TOOLS:
             repeat_penalty = self._config.repeat_call_penalty
@@ -241,7 +253,7 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         # Re-sync costs after penalties
         self._state.costs = self.core.costs
 
-        total_reward = tool_reward + passive_penalty + repeat_penalty
+        total_reward = tool_reward + passive_penalty + repeat_penalty + invalid_penalty
         self._state.cumulative_reward += total_reward
 
         done = (

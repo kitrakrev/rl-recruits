@@ -111,10 +111,24 @@ TOOLS: list[dict] = [
         "description": "See which roles are currently most requested by clients.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
+        "name": "find_available_projects",
+        "description": "Get list of all open projects needing staffing, with project_id, role_id, developer_type, and bill_rate_weekly.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
         "name": "confirm_project",
         "description": "Commit to taking on a project from a client.",
         "parameters": {"type": "object", "properties": {
             "project_id": {"type": "string"}}, "required": ["project_id"]}}},
+    {"type": "function", "function": {
+        "name": "pass_on_project",
+        "description": "Decline a project you cannot fill. Avoids expiry penalty.",
+        "parameters": {"type": "object", "properties": {
+            "project_id": {"type": "string"}}, "required": ["project_id"]}}},
+    {"type": "function", "function": {
+        "name": "let_go_candidate",
+        "description": "Release a hired candidate from bench. Incurs 2x weekly salary severance.",
+        "parameters": {"type": "object", "properties": {
+            "candidate_id": {"type": "string"}}, "required": ["candidate_id"]}}},
     {"type": "function", "function": {
         "name": "advance_week",
         "description": (

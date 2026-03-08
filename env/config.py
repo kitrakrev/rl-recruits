@@ -55,9 +55,12 @@ class Config:
 
     # --- Server behaviour penalties ---
     # These are subtracted from total_reward in staffing_environment.step().
-    passive_streak_penalty: float = -50.0    # $ per turn after threshold consecutive GET calls
-    passive_streak_threshold: int = 3        # free GET-only turns before penalty kicks in
-    repeat_call_penalty: float = -100.0      # $ penalty for calling the same tool twice in a row
+    # Set to 0 for training (penalties sabotage RL reward signal).
+    # Re-enable for deployed MCP agent if desired.
+    passive_streak_penalty: float = 0.0      # $ per turn after threshold consecutive GET calls
+    passive_streak_threshold: int = 999      # free GET-only turns before penalty kicks in
+    repeat_call_penalty: float = 0.0         # $ penalty for calling the same tool twice in a row
+    invalid_action_penalty: float = -100.0   # reward penalty for failed execute-tool calls (wrong IDs, wrong status, etc.)
 
     # --- LLM ---
     llm_mode: Literal["stub", "live"] = "stub"

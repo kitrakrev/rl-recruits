@@ -40,8 +40,11 @@ class TrainingConfig:
 
     # --- Generation ---
     max_turns_per_step: int = 10    # max tool calls per week before auto-advance
-    max_prompt_len: int = 2048      # left-truncation limit for prompt tokens
-    max_full_len: int = 2560        # truncation limit for prompt + completion
+    max_prompt_len: int = 4096      # left-truncation limit for prompt tokens
+                                    # (system prompt + 15 tools ≈ 2500 tokens alone;
+                                    #  2048 was too small for 8B and truncated
+                                    #  the system prompt, causing garbage output)
+    max_full_len: int = 4608        # truncation limit for prompt + completion
     max_new_tokens: int = 512       # generation budget per turn
     # Qwen3 non-thinking mode recommended settings (HF model card)
     temperature: float = 0.7

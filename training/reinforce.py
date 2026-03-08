@@ -28,11 +28,15 @@ Why not TRL's GRPOTrainer?
 """
 from __future__ import annotations
 
+import os
 import random
 import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+# Reduce CUDA memory fragmentation — critical for 8B models on 80GB GPUs.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 if TYPE_CHECKING:
     from training.config import TrainingConfig
@@ -118,6 +122,10 @@ def train_grpo(cfg: "TrainingConfig") -> None:
     model = get_peft_model(base_model, lora_cfg)
     model.print_trainable_parameters()
 
+    # Enable gradient checkpointing to trade compute for VRAM.
+    # Essential for 8B models on 80GB GPUs — saves ~50% activation memory.
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
     # Only optimise the LoRA adapter parameters
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -195,7 +203,7 @@ def train_grpo(cfg: "TrainingConfig") -> None:
 
         for batch_start in range(0, len(indices), cfg.train_batch_size):
             batch_idx  = indices[batch_start : batch_start + cfg.train_batch_size]
-            batch_loss = torch.tensor(0.0, device=model.device)
+            batch_loss_accum = 0.0  # scalar accumulator (no graph retention)
 
             for idx in batch_idx:
                 prompt_str     = prompts_v[idx]
@@ -222,33 +230,43 @@ def train_grpo(cfg: "TrainingConfig") -> None:
 
                 completion_ids = full_ids[:, comp_start:]
 
+                # Reference log-probs FIRST (no grad) — compute before the
+                # policy forward pass so the policy graph is the only thing
+                # in memory when we call .backward().
+                with torch.no_grad(), model.disable_adapter():
+                    ref_logits = model(full_ids).logits[:, comp_start - 1 : -1, :]
+                    ref_log_p  = F.log_softmax(ref_logits, dim=-1)
+                    ref_tok_lp = ref_log_p.gather(2, completion_ids.unsqueeze(-1)).squeeze(-1)
+
                 # Policy log-probs (LoRA adapters active)
                 logits    = model(full_ids).logits[:, comp_start - 1 : -1, :]
                 log_probs = F.log_softmax(logits, dim=-1)
                 tok_lp    = log_probs.gather(2, completion_ids.unsqueeze(-1)).squeeze(-1)
                 avg_log_p = tok_lp.mean()
 
-                # Reference log-probs: base model = disable LoRA adapters temporarily.
-                # This avoids loading a second full-size model copy.
-                with torch.no_grad(), model.disable_adapter():
-                    ref_logits = model(full_ids).logits[:, comp_start - 1 : -1, :]
-                    ref_log_p  = F.log_softmax(ref_logits, dim=-1)
-                    ref_tok_lp = ref_log_p.gather(2, completion_ids.unsqueeze(-1)).squeeze(-1)
-
                 # Per-token KL: p * (log p − log q)
                 kl = (tok_lp.exp() * (tok_lp - ref_tok_lp)).mean()
                 ep_kl_sum += kl.item()
 
-                step_loss  = -adv * avg_log_p + cfg.kl_coeff * kl
-                batch_loss = batch_loss + step_loss / len(batch_idx)
+                step_loss  = (-adv * avg_log_p + cfg.kl_coeff * kl) / len(batch_idx)
 
-            batch_loss.backward()
+                # Backward PER SAMPLE — gradients accumulate in .grad buffers
+                # but the computation graph is freed immediately, so only ONE
+                # sample's activations live in VRAM at a time.
+                step_loss.backward()
+                batch_loss_accum += step_loss.item()
+
+                # Free intermediate tensors before next sample
+                del logits, log_probs, tok_lp, ref_logits, ref_log_p, ref_tok_lp
+                del full_ids, prompt_ids, completion_ids
+                torch.cuda.empty_cache()
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad()
 
-            ep_loss_sum += batch_loss.item()
-            all_losses.append(batch_loss.item())
+            ep_loss_sum += batch_loss_accum
+            all_losses.append(batch_loss_accum)
             n_batches += 1
 
         avg_ep_loss = ep_loss_sum / max(1, n_batches)
