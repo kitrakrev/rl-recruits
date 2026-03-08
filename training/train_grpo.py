@@ -820,16 +820,6 @@ def train_grpo(args):
     # Env helpers — use sync HTTP directly (same as dry_run)
     # -----------------------------------------------------------------------
 
-    # Tracking state for reward curves + metrics (mirrors dry_run output)
-    _tracking = {
-        "episode_rewards": [],   # cumulative reward per episode
-        "episode_profits": [],   # net profit per episode
-        "_cur_reward": 0.0,      # running reward for current episode
-        "_step": 0,              # global step counter
-        "_ep_step": 0,           # steps within current episode
-    }
-    _STEPS_PER_EPISODE = 52  # matches env config
-
     def _http_step(tool_name: str, params: dict) -> tuple[float, float]:
         """Execute one tool call. Returns (reward, profit)."""
         try:
@@ -856,7 +846,7 @@ def train_grpo(args):
             return f"Episode started. (reset error: {e})"
 
     # -----------------------------------------------------------------------
-    # Reward function — executes tool in env, returns reward + tracks metrics
+    # Reward function — executes tool in env, returns reward
     # -----------------------------------------------------------------------
     def reward_fn_profit(completions: list[str], **kwargs) -> list[float]:
         """Primary reward: run the tool call against the live env."""
@@ -865,31 +855,42 @@ def train_grpo(args):
             parsed = parse_tool_call(c)
             if parsed:
                 tool_name, params = parsed
-                reward, profit = _http_step(tool_name, params)
+                reward, _ = _http_step(tool_name, params)
             else:
-                reward, profit = -0.1, 0.0
-
+                reward = -0.1
             rewards.append(reward)
-
-            # Track per-episode metrics
-            _tracking["_cur_reward"] += reward
-            _tracking["_ep_step"] += 1
-            _tracking["_step"] += 1
-
-            # Episode boundary: flush accumulated reward/profit
-            if _tracking["_ep_step"] >= _STEPS_PER_EPISODE:
-                _tracking["episode_rewards"].append(_tracking["_cur_reward"])
-                _tracking["episode_profits"].append(profit)
-                _tracking["_cur_reward"] = 0.0
-                _tracking["_ep_step"] = 0
-                ep_num = len(_tracking["episode_rewards"])
-                print(
-                    f"  [train] ep={ep_num:4d}  "
-                    f"reward={_tracking['episode_rewards'][-1]:+8.3f}  "
-                    f"profit=${profit:>10,.0f}"
-                )
-
         return rewards
+
+    # -----------------------------------------------------------------------
+    # Callback — captures TRL's per-step logs for reward curves + metrics
+    # -----------------------------------------------------------------------
+    from transformers import TrainerCallback
+
+    class MetricsCallback(TrainerCallback):
+        """Collects per-step metrics from TRL trainer logs."""
+        def __init__(self):
+            self.step_rewards = []     # reward/mean per logged step
+            self.step_profits = []     # env reward (profit signal) per logged step
+            self.step_losses  = []     # train_loss per logged step
+
+        def on_log(self, _args, state, control, logs=None, **kwargs):
+            if logs is None:
+                return
+            step_r = logs.get("reward", logs.get("rewards/reward_fn_profit/mean", 0.0))
+            env_r  = logs.get("rewards/reward_fn_profit/mean", 0.0)
+            loss   = logs.get("train_loss", logs.get("loss", None))
+            self.step_rewards.append(float(step_r))
+            self.step_profits.append(float(env_r))
+            if loss is not None:
+                self.step_losses.append(float(loss))
+            print(
+                f"  [train] step={state.global_step:4d}  "
+                f"reward={float(step_r):+7.4f}  "
+                f"env_reward={float(env_r):+7.4f}"
+                + (f"  loss={float(loss):.4f}" if loss is not None else "")
+            )
+
+    metrics_cb = MetricsCallback()
 
     # -----------------------------------------------------------------------
     # Dataset — varied initial state prompts
@@ -923,7 +924,7 @@ def train_grpo(args):
         num_generations=4,          # must divide generation_batch_size (1×4=4)
         learning_rate=5e-6,
         max_completion_length=256,
-        logging_steps=10,
+        logging_steps=1,    # log every step so metrics are always captured
         save_steps=50,
         seed=args.seed,
     )
@@ -942,6 +943,7 @@ def train_grpo(args):
         train_dataset=dataset,
         processing_class=tokenizer,
         reward_funcs=[reward_fn_profit, reward_fn_tool_format, reward_fn_placement],
+        callbacks=[metrics_cb],
     )
 
     print(f"\nStarting GRPO training: {args.num_episodes} episodes")
@@ -952,24 +954,35 @@ def train_grpo(args):
     print(f"\n[✓] Training complete. Model saved to {args.output_dir}")
 
     # -----------------------------------------------------------------------
-    # Save reward curves + metrics (same as dry_run)
+    # Save reward curves + metrics using captured callback data
     # -----------------------------------------------------------------------
-    if _tracking["episode_rewards"]:
-        # Flush any partial episode at end of training
-        if _tracking["_ep_step"] > 0:
-            _tracking["episode_rewards"].append(_tracking["_cur_reward"])
-            _tracking["episode_profits"].append(0.0)
+    step_rewards = metrics_cb.step_rewards
+    step_profits = metrics_cb.step_profits
 
+    if not step_rewards:
+        # Fallback: extract from trainer.state.log_history
+        step_rewards = [
+            float(log.get("reward", log.get("rewards/reward_fn_profit/mean", 0.0)))
+            for log in trainer.state.log_history
+            if "reward" in log or "rewards/reward_fn_profit/mean" in log
+        ]
+        step_profits = [
+            float(log.get("rewards/reward_fn_profit/mean", 0.0))
+            for log in trainer.state.log_history
+            if "rewards/reward_fn_profit/mean" in log
+        ]
+
+    if step_rewards:
         results = {
             "grpo_training": {
-                "rewards": _tracking["episode_rewards"],
-                "profits": _tracking["episode_profits"],
+                "rewards": step_rewards,
+                "profits": step_profits if step_profits else step_rewards,
             }
         }
-        _plot_reward_curves(results, len(_tracking["episode_rewards"]))
+        _plot_reward_curves(results, len(step_rewards))
         _save_metrics(results)
     else:
-        print("[!] No episode data collected — reward curves not saved.")
+        print("[!] No step data collected — reward curves not saved.")
 
 
 # ---------------------------------------------------------------------------
