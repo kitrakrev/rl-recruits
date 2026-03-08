@@ -407,7 +407,6 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             )
             result = {"candidates": r["candidates"], "count": r["count"]}
             if r["count"] == 0:
-                # Show what types are actually available so model can adjust filter
                 from collections import Counter
                 type_counts = Counter(c.developer_type for c in env.core.market)
                 result["no_results_reason"] = (
@@ -415,7 +414,15 @@ class StaffingAgencyEnvironment(MCPEnvironment):
                     f"seniority='{seniority_level}' min_skill={min_skill_score}."
                 )
                 result["available_types_in_market"] = dict(type_counts)
-                result["fix"] = "Adjust your filters to match one of the types above, or call find_candidate() with no filters."
+                result["fix"] = "Adjust your filters or call find_candidate() with no filters."
+            else:
+                # Prominently remind the model of the required two-step before hiring
+                ids = [c["id"] for c in result["candidates"][:5]]
+                result["REQUIRED_NEXT_STEP"] = (
+                    f"You MUST call interview_candidate(candidate_id=<id>) BEFORE hire_candidate. "
+                    f"Valid candidate IDs from this search: {ids}. "
+                    f"Example: interview_candidate(candidate_id=\"{ids[0]}\")"
+                )
             return result
 
         @mcp.tool()
@@ -445,11 +452,24 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             env._last_tool_reward = float(res.pop("reward", 0.0))
 
             if not res.get("success", True):
-                market = [{"id": c.id, "type": c.developer_type, "seniority": c.seniority_level}
-                          for c in env.core.market[:10]]
-                res["reason"] = f"Candidate '{candidate_id}' not found or not ready to hire (wrong status/ID)."
-                res["available_in_market"] = market
-                res["fix"] = "Call find_candidate() to get fresh IDs, then interview before hiring."
+                # Check if candidate is in market (needs interview) or truly gone
+                in_market = next((c for c in env.core.market if c.id == candidate_id), None)
+                if in_market:
+                    res["reason"] = (
+                        f"Candidate '{candidate_id}' IS in the market but has NOT been interviewed yet. "
+                        f"You MUST call interview_candidate(candidate_id=\"{candidate_id}\") FIRST, "
+                        f"then hire_candidate(candidate_id=\"{candidate_id}\")."
+                    )
+                    res["fix"] = f"Call interview_candidate(candidate_id=\"{candidate_id}\") now."
+                else:
+                    market_now = [{"id": c.id, "type": c.developer_type, "seniority": c.seniority_level}
+                                  for c in env.core.market[:8]]
+                    res["reason"] = (
+                        f"Candidate '{candidate_id}' no longer exists (left market or wrong ID). "
+                        f"Current market has {len(env.core.market)} candidates."
+                    )
+                    res["current_market_ids"] = market_now
+                    res["fix"] = "Call find_candidate() to get current IDs, then interview_candidate(), then hire_candidate()."
                 return res
 
             # Attach compatible open roles so the model can match immediately

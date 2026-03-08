@@ -26,10 +26,12 @@ STEP 1 — Discover open projects and what types they need:
   → ALWAYS call this first so you know what types of candidates to hire
 
 STEP 2 — Hire candidates that match open role types:
-  find_candidate(developer_type="backend")    ← use type from find_available_projects
-  interview_candidate(candidate_id="C3")      ← costs $500
-  negotiate_salary(candidate_id="C3", offer_weekly=1200)
-  hire_candidate(candidate_id="C3")           ← costs $2,000
+  find_candidate(developer_type="backend")    ← returns IDs of market candidates
+  interview_candidate(candidate_id="C3")      ← MANDATORY before hire. Costs $500. Reveals skill.
+  negotiate_salary(candidate_id="C3", offer_weekly=1200)  ← optional, lowers salary
+  hire_candidate(candidate_id="C3")           ← only works AFTER interview. Costs $2,000.
+
+  ⚠ hire_candidate WILL FAIL with "not found" if you skip interview_candidate first.
 
 STEP 3 — Place the candidate (types MUST match):
   confirm_project(project_id="P2")            ← commit to the project first
