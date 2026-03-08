@@ -185,7 +185,7 @@ class StaffingEnv:
                 unfilled = role.headcount - role.filled_count
                 if unfilled > 0:
                     # Use average weekly client rate as penalty proxy
-                    penalty = unfilled * (85_000 / 52) * 1.25 * project.deadline_remaining
+                    penalty = unfilled * (85_000 / 52) * 1.25
                     reward -= penalty
                     self._costs += penalty
             self._expired_projects.append(project.to_dict())
