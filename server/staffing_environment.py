@@ -387,6 +387,36 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         def confirm_project(project_id: str) -> dict:
             res = env.core.tool_confirm_project(project_id)
             env._last_tool_reward = float(res.pop("reward", 0.0))
+            if not res.get("success", True):
+                open_projects = [
+                    {"project_id": p.project_id,
+                     "roles": [{"role_id": ro.role_id, "needs_type": ro.developer_type,
+                                "min_skill": ro.min_skill_score, "bill_rate": ro.bill_rate_weekly}
+                               for ro in p.roles if not ro.is_filled]}
+                    for cl in env.core.clients for p in cl.projects
+                    if p.fill_status != "SEALED"
+                ]
+                res["reason"] = f"Project '{project_id}' not found or already sealed."
+                res["open_projects"] = open_projects[:6]
+                res["fix"] = (
+                    "Call find_available_projects() to get valid project_ids, "
+                    "then confirm_project(project_id=<valid_id>)."
+                )
+            else:
+                # On success, show the roles that now need to be filled
+                project = next(
+                    (p for cl in env.core.clients for p in cl.projects if p.project_id == project_id), None
+                )
+                if project:
+                    open_roles = [{"role_id": ro.role_id, "needs_type": ro.developer_type,
+                                   "min_skill": ro.min_skill_score, "bill_rate": ro.bill_rate_weekly}
+                                  for ro in project.roles if not ro.is_filled]
+                    res["roles_to_fill"] = open_roles
+                    res["next_step"] = (
+                        f"Now match a hired candidate to one of these roles: {open_roles[:3]}. "
+                        f"Call match_candidate_to_project(candidate_id=<id>, "
+                        f"project_id=\"{project_id}\", role_id=<role_id>)."
+                    )
             return res
 
         @mcp.tool()
@@ -508,6 +538,20 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         def negotiate_salary(candidate_id: str, offer_weekly: float) -> dict:
             res = env.core.tool_negotiate_salary(candidate_id, offer_weekly)
             env._last_tool_reward = float(res.pop("reward", 0.0))
+            if not res.get("success", True):
+                in_market = next((c for c in env.core.market if c.id == candidate_id), None)
+                in_roster = env.core.candidates.get(candidate_id)
+                if in_market:
+                    res["reason"] = f"Candidate '{candidate_id}' is in the market but must be interviewed first."
+                    res["fix"] = f"Call interview_candidate(candidate_id=\"{candidate_id}\") first."
+                elif not in_roster:
+                    market = [{"id": c.id, "type": c.developer_type} for c in env.core.market[:6]]
+                    res["reason"] = f"Candidate '{candidate_id}' not found anywhere."
+                    res["current_market"] = market
+                    res["fix"] = "Call find_candidate() to get fresh IDs."
+                else:
+                    res["reason"] = f"Cannot negotiate with candidate '{candidate_id}' in status '{in_roster.status}'."
+                    res["fix"] = "Negotiate only with candidates who have been interviewed (status=in_pipeline)."
             return res
 
         @mcp.tool()
@@ -517,8 +561,24 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             env._last_tool_reward = float(res.pop("reward", 0.0))
             if not res.get("success", True):
                 err = res.get("error", "")
+                # Candidate not in hired status
+                if "hired" in err.lower() or "status" in err.lower() or "available" in err.lower():
+                    hired = [{"id": c.id, "type": c.developer_type, "status": c.status}
+                             for c in env.core.candidates.values()
+                             if c.status == "hired"]
+                    in_market = next((c for c in env.core.market if c.id == candidate_id), None)
+                    if in_market:
+                        res["reason"] = (
+                            f"Candidate '{candidate_id}' is still in the market (not yet hired). "
+                            f"Workflow: find_candidate → interview_candidate → hire_candidate → match."
+                        )
+                        res["fix"] = f"Call interview_candidate(candidate_id=\"{candidate_id}\") then hire_candidate."
+                    else:
+                        res["reason"] = f"Candidate '{candidate_id}' is not in 'hired' status."
+                        res["your_hired_candidates"] = hired
+                        res["fix"] = "Only match candidates with status='hired'. Use an ID from 'your_hired_candidates'."
                 # Type/skill mismatch: show what the candidate has vs what the role needs
-                if "type mismatch" in err.lower() or "insufficient skill" in err.lower():
+                elif "type mismatch" in err.lower() or "insufficient skill" in err.lower() or "type mismatch" in err.upper():
                     c_type  = res.get("candidate_type", "?")
                     r_type  = res.get("role_type", "?")
                     c_skill = res.get("candidate_skill", "?")
@@ -575,12 +635,26 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         def request_project_extension(project_id: str) -> dict:
             res = env.core.tool_request_project_extension(project_id)
             env._last_tool_reward = float(res.pop("reward", 0.0))
+            if not res.get("success", True):
+                open_projects = [{"project_id": p.project_id, "deadline_week": p.deadline_week}
+                                 for cl in env.core.clients for p in cl.projects
+                                 if p.fill_status != "SEALED"]
+                res["reason"] = f"Project '{project_id}' not found or not extendable."
+                res["open_projects"] = open_projects[:6]
+                res["fix"] = "Use a project_id from 'open_projects'. Call find_available_projects() to refresh."
             return res
 
         @mcp.tool()
         def pass_on_project(project_id: str) -> dict:
             res = env.core.tool_pass_on_project(project_id)
             env._last_tool_reward = float(res.pop("reward", 0.0))
+            if not res.get("success", True):
+                open_projects = [{"project_id": p.project_id, "fill_status": p.fill_status}
+                                 for cl in env.core.clients for p in cl.projects
+                                 if p.fill_status != "SEALED"]
+                res["reason"] = f"Project '{project_id}' not found."
+                res["open_projects"] = open_projects[:6]
+                res["fix"] = "Use a project_id from 'open_projects'. Call find_available_projects() to refresh."
             return res
 
         @mcp.tool()
