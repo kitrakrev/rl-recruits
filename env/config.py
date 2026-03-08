@@ -1,10 +1,15 @@
 """
-All tunable parameters for the Staffing Agency RL environment.
-Override via environment variables or pass a Config object to StaffingEnv.
+Environment configuration for the Staffing Agency RL simulation.
+
+Config  — passed to StaffingAgencyEnvironment; controls episode length,
+          economics, curriculum stage, LLM mode, and server-side penalties.
+          Live-patchable via PATCH /config/env.
+
+Training hyperparameters live in training/config.py → TrainingConfig.
 """
 import os
-from dataclasses import dataclass, field
-from typing import Literal
+from dataclasses import dataclass, field, fields as dc_fields
+from typing import Literal, Any  # Any used in Config.update()
 
 
 @dataclass
@@ -47,6 +52,12 @@ class Config:
     margin_pct: float = 0.25           # legacy, client_rate was salary × 1.25
     cost_per_interview: float = 500.0
 
+
+    # --- Server behaviour penalties ---
+    # These are subtracted from total_reward in staffing_environment.step().
+    passive_streak_penalty: float = -50.0    # $ per turn after threshold consecutive GET calls
+    passive_streak_threshold: int = 3        # free GET-only turns before penalty kicks in
+    repeat_call_penalty: float = -100.0      # $ penalty for calling the same tool twice in a row
 
     # --- LLM ---
     llm_mode: Literal["stub", "live"] = "stub"
@@ -93,3 +104,34 @@ class Config:
         # fallback to highest tier
         _, _, _, annual_salary, annual_client = self.rating_tiers[-1]
         return annual_salary / 52, annual_client / 52
+
+    def to_dict(self) -> dict:
+        """Serialise to plain dict (for /config/env API response)."""
+        out: dict = {}
+        for f in dc_fields(self):
+            v = getattr(self, f.name)
+            out[f.name] = list(v) if isinstance(v, set) else v
+        return out
+
+    def update(self, updates: dict[str, Any]) -> list[str]:
+        """Apply a partial update dict. Returns list of keys that were changed."""
+        changed: list[str] = []
+        field_types = {f.name: f.type for f in dc_fields(self)}
+        for key, value in updates.items():
+            if not hasattr(self, key):
+                continue
+            try:
+                current = getattr(self, key)
+                # Coerce to existing type where safe
+                if isinstance(current, bool):
+                    value = bool(value)
+                elif isinstance(current, int):
+                    value = int(value)
+                elif isinstance(current, float):
+                    value = float(value)
+                setattr(self, key, value)
+                changed.append(key)
+            except (TypeError, ValueError):
+                pass
+        return changed
+
