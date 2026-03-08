@@ -1014,8 +1014,6 @@ def train_grpo(args):
         logging_steps=1,
         save_steps=50,
         seed=args.seed,
-        # Disable default reward normalization so MC returns pass through cleanly
-        missing_eos_penalty=0.0,
     )
 
     # -----------------------------------------------------------------------
