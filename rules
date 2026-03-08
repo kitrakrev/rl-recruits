@@ -1,0 +1,6 @@
+use python3
+use uv  venv
+if llm not there have a stub returning a static text or basaed on some probaiblity distribution
+assume stuff , if not provided, make the best guess. put all inside a guess.md file
+make a plan and store it in a plan.md file with checkboxes and updating with progress
+update the progress in plan.md file with ticks 

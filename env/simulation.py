@@ -1,0 +1,257 @@
+"""
+Simulation logic — stochastic world dynamics that run each step.
+Handles: project arrivals, deadlines, candidate patience, contracts, churn.
+"""
+from __future__ import annotations
+import random
+import uuid
+from typing import TYPE_CHECKING
+
+from .models import Candidate, Role, Project, Client
+
+if TYPE_CHECKING:
+    from .config import Config
+    from .llm import LLMRouter
+
+
+def _uid() -> str:
+    return str(uuid.uuid4())[:8]
+
+
+# ---------------------------------------------------------------------------
+# Candidate generation
+# ---------------------------------------------------------------------------
+
+def generate_candidate(config: "Config", rng: random.Random) -> Candidate:
+    dev_type = rng.choice(config.developer_types)
+    seniority = rng.choices(
+        config.seniority_levels, weights=[0.40, 0.40, 0.20]
+    )[0]
+    # skill_score: Beta(2,2) rescaled to [0.3, 1.0]
+    raw = rng.betavariate(2, 2)
+    skill = round(0.3 + raw * 0.7, 3)
+
+    # salary_expectation: roughly market weekly rate ±10%
+    # Use rating=3 (average) as baseline expectation before interview
+    baseline_weekly = 85_000 / 52
+    expectation = round(baseline_weekly * rng.uniform(0.85, 1.15), 2)
+
+    patience = config.t_patience + rng.randint(-2, 2)
+    patience = max(4, patience)
+
+    cid = f"C-{dev_type[:2].upper()}-{_uid()}"
+    return Candidate(
+        id=cid,
+        developer_type=dev_type,
+        seniority_level=seniority,
+        skill_score=skill,
+        salary_expectation=expectation,
+        patience_remaining=patience,
+        status="available",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Project / Role generation
+# ---------------------------------------------------------------------------
+
+def generate_project(client: Client, config: "Config", rng: random.Random) -> Project:
+    pid = f"P-{client.client_id[:3]}-{_uid()}"
+    deadline = rng.randint(config.t_deadline_min, config.t_deadline_max)
+    n_roles = rng.randint(1, config.max_roles_per_project)
+
+    # In curriculum stage 1, restrict to 1 role
+    if config.curriculum_stage == 1:
+        n_roles = 1
+
+    roles = []
+    for i in range(n_roles):
+        rid = f"R-{pid}-{i}"
+        dev_type = rng.choice(config.developer_types)
+        if config.curriculum_stage == 1:
+            dev_type = config.developer_types[0]
+        seniority = rng.choices(
+            config.seniority_levels, weights=[0.35, 0.45, 0.20]
+        )[0]
+        min_skill = round(rng.uniform(0.3, 0.8), 2)
+        headcount = rng.randint(1, config.max_headcount_per_role)
+        roles.append(Role(
+            role_id=rid,
+            developer_type=dev_type,
+            seniority=seniority,
+            min_skill_score=min_skill,
+            headcount=headcount,
+        ))
+
+    return Project(
+        project_id=pid,
+        client_id=client.client_id,
+        roles=roles,
+        deadline_remaining=deadline,
+    )
+
+
+def generate_client(client_idx: int, config: "Config", rng: random.Random) -> Client:
+    industry = rng.choice(config.industries)
+    cid = f"CL-{industry[:3].upper()}-{client_idx:02d}"
+    return Client(
+        client_id=cid,
+        industry=industry,
+        satisfaction_score=config.initial_satisfaction,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step-level world dynamics
+# ---------------------------------------------------------------------------
+
+def tick_project_arrivals(
+    clients: list[Client],
+    config: "Config",
+    rng: random.Random,
+) -> list[Project]:
+    """Stochastically add new projects for each client (Poisson arrivals)."""
+    new_projects = []
+    for client in clients:
+        if client.churn_risk:
+            continue  # churned clients stop submitting
+        open_count = client.num_open_projects
+        if open_count >= config.max_open_projects_per_client:
+            continue
+        # Poisson: P(k arrivals) where λ = config.project_arrival_lambda
+        arrivals = _poisson_sample(config.project_arrival_lambda, rng)
+        for _ in range(arrivals):
+            if client.num_open_projects >= config.max_open_projects_per_client:
+                break
+            project = generate_project(client, config, rng)
+            client.projects.append(project)
+            client.num_projects_submitted += 1
+            new_projects.append(project)
+    return new_projects
+
+
+def _poisson_sample(lam: float, rng: random.Random) -> int:
+    """Simple Poisson sampler via Knuth algorithm."""
+    import math
+    L = math.exp(-lam)
+    k, p = 0, 1.0
+    while p > L:
+        k += 1
+        p *= rng.random()
+    return k - 1
+
+
+def tick_project_deadlines(
+    clients: list[Client],
+    llm: "LLMRouter",
+) -> list[tuple[Project, Client]]:
+    """Decrement deadlines; return list of (expired_project, client) pairs."""
+    expired = []
+    for client in clients:
+        still_active = []
+        for project in client.projects:
+            if project.fill_status == "SEALED":
+                still_active.append(project)
+                continue
+            project.deadline_remaining -= 1
+            if project.deadline_remaining <= 0:
+                expired.append((project, client))
+                client.num_projects_expired += 1
+                # Update satisfaction
+                event = {"type": "project_expired", "project_id": project.project_id}
+                result = llm.client_satisfaction(client, event, client.event_history)
+                client.satisfaction_score = result.new_score
+                client.churn_risk = result.churn_risk
+                client.event_history.append(event)
+            else:
+                still_active.append(project)
+        client.projects = still_active
+    return expired
+
+
+def tick_candidate_patience(
+    candidates: list[Candidate],
+    llm: "LLMRouter",
+    agency_context: dict,
+) -> list[Candidate]:
+    """Decrement patience for benched candidates; return list of leavers."""
+    leavers = []
+    for c in candidates:
+        if c.status not in ("hired",):
+            continue  # only benched (hired but not placed) candidates age
+        c.weeks_on_bench += 1
+        if c.patience_remaining <= 2:
+            result = llm.candidate_leave(c, agency_context)
+            c.patience_remaining = result.patience_remaining
+            if result.leaves:
+                leavers.append(c)
+        else:
+            c.patience_remaining -= 1
+    return leavers
+
+
+def tick_contracts(
+    candidates: list[Candidate],
+) -> list[Candidate]:
+    """Decrement contract weeks; return candidates whose contracts completed."""
+    returning = []
+    for c in candidates:
+        if c.status != "placed" or c.contract_weeks_left is None:
+            continue
+        c.contract_weeks_left -= 1
+        if c.contract_weeks_left <= 0:
+            returning.append(c)
+    return returning
+
+
+def replenish_market(
+    market: list[Candidate],
+    config: "Config",
+    rng: random.Random,
+) -> None:
+    """Keep market pool up to max size."""
+    while len(market) < config.market_pool_size:
+        market.append(generate_candidate(config, rng))
+
+
+# ---------------------------------------------------------------------------
+# Matching helpers
+# ---------------------------------------------------------------------------
+
+def compute_match_score(
+    candidate: Candidate,
+    role: Role,
+    config: "Config",
+) -> float:
+    """Return match score 0.0–1.0; 0.0 means illegal (blocked)."""
+    adjacent_types = config.adjacency.get(candidate.developer_type, set())
+
+    # Type check
+    if role.developer_type not in adjacent_types:
+        return 0.0  # illegal
+
+    # Skill check
+    if candidate.skill_score < role.min_skill_score:
+        return 0.0  # illegal
+
+    # Seniority compatibility
+    sen_ok = _seniority_ok(candidate.seniority_level, role.seniority)
+    if not sen_ok:
+        return 0.0  # illegal
+
+    # Score breakdown
+    exact_type = candidate.developer_type == role.developer_type
+    exact_seniority = candidate.seniority_level == role.seniority
+
+    if exact_type and exact_seniority:
+        return 1.0
+    elif not exact_type:
+        return 0.7   # adjacent type
+    else:
+        return 0.85  # seniority mismatch (overqualified)
+
+
+def _seniority_ok(candidate_sen: str, role_sen: str) -> bool:
+    """Senior can fill any role; mid fills junior/mid; junior fills junior only."""
+    order = {"junior": 0, "mid": 1, "senior": 2}
+    return order.get(candidate_sen, 0) >= order.get(role_sen, 0)

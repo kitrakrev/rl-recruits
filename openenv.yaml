@@ -1,0 +1,54 @@
+name: staffing-agency
+version: 0.1.0
+description: >
+  Multi-agent staffing agency RL environment. The LLM agent acts as a CEO
+  managing candidates and clients over a 52-week simulated business year.
+  Combines long-horizon planning with multi-actor management.
+
+# OpenEnv hackathon themes:
+#   - Multi-Agent Interactions (clients + candidates)
+#   - Long-Horizon Planning (52 steps, sparse sealing reward)
+#   - Scale AI sub-theme: HR & IT business workflow
+#   - Mercor sub-theme: reward scales with quality of placements
+
+entry_point: server.app:app
+port: 8000
+
+environment:
+  LLM_MODE: stub          # stub | live
+  ANTHROPIC_API_KEY: ""   # set for live LLM mode
+
+curriculum:
+  stage_1:
+    clients: 1
+    developer_types: 1
+    max_roles_per_project: 1
+  stage_2:
+    clients: 3
+    developer_types: 3
+    max_roles_per_project: 2
+  stage_3:
+    clients: 3
+    developer_types: 5
+    max_roles_per_project: 3
+
+tools:
+  get:
+    - get_agency_state
+    - get_client_state
+    - get_candidate_state
+    - get_project_details
+    - get_candidate_profile
+    - get_market_demand
+    - get_financial_summary
+  execute:
+    - find_available_projects
+    - confirm_project
+    - find_candidate
+    - interview_candidate
+    - hire_candidate
+    - negotiate_salary
+    - match_candidate_to_project
+    - let_go_candidate
+    - request_project_extension
+    - pass_on_project

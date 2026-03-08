@@ -1,0 +1,42 @@
+[project]
+name = "rl-recruiter"
+version = "0.1.0"
+description = "Staffing Agency OpenEnv — Multi-Agent HR environment for LLM RL training"
+requires-python = ">=3.10"
+dependencies = [
+    "openenv-core>=0.1.0",
+    "fastmcp>=2.0.0",
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.29.0",
+    "numpy>=1.26.0",
+    "pydantic>=2.7.0",
+    "anthropic>=0.28.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+ui = [
+    "gradio>=4.0.0",
+    "plotly>=5.20.0",
+    "requests>=2.31.0",
+]
+train = [
+    "trl>=0.9.0",
+    "transformers>=4.40.0",
+    "torch>=2.2.0",
+    "datasets>=2.18.0",
+    "matplotlib>=3.8.0",
+    "pandas>=2.0.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "httpx>=0.27.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["env", "server"]
