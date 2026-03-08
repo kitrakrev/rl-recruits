@@ -879,7 +879,6 @@ def train_grpo(args):
         gradient_accumulation_steps=4,
         learning_rate=5e-6,
         max_completion_length=256,
-        reward_funcs=[reward_fn_profit, reward_fn_tool_format, reward_fn_placement],
         logging_steps=10,
         save_steps=50,
         seed=args.seed,
