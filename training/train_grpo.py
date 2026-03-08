@@ -275,28 +275,107 @@ def dry_run_simulate(env_url: str, num_episodes: int, max_turns: int, seed: int)
                 ep_reward = 0.0
                 final_profit = 0.0
                 # policy_state caches candidate/project lists fetched this step
-                policy_state: dict = {}
+                policy_state: dict = {"_step": 0, "_last_proj_refresh": -99, "_last_mkt_refresh": -99}
+                verbose = False  # set True for debug: (ep == 0 and policy_name == "optimal_heuristic")
 
-                for _ in range(52):
+                for tick in range(52):
+                    policy_state["_step"] = policy_state.get("_step", 0) + 1
                     action = policy_fn(env, rng, policy_state)
                     try:
                         result = env.step(action)
                         ep_reward += float(result.reward or 0.0)
                         final_profit = result.observation.profit
+                        if verbose:
+                            tr_dbg = result.observation.tool_result or {}
+                            succ = tr_dbg.get("success", "n/a") if isinstance(tr_dbg, dict) else "n/a"
+                            err = tr_dbg.get("error", "")[:60] if isinstance(tr_dbg, dict) else ""
+                            n_cands = len(policy_state.get("candidates", []))
+                            n_hired = sum(1 for c in policy_state.get("candidates", []) if c.get("status") == "hired")
+                            n_pipe = sum(1 for c in policy_state.get("candidates", []) if c.get("status") == "in_pipeline")
+                            n_placed = sum(1 for c in policy_state.get("candidates", []) if c.get("status") == "placed")
+                            print(f"    T{tick:2d} {action.tool:30s} ok={str(succ):5s} rwd={float(result.reward or 0):+7.2f} "
+                                  f"pft=${final_profit:>8,.0f} pipe={n_pipe} hire={n_hired} plcd={n_placed} "
+                                  f"{err}")
                         # Update cache for next step's policy decision
                         tr = result.observation.tool_result or {}
                         if isinstance(tr, dict):
-                            if "candidates" in tr:
-                                # find_candidate or get_candidate_state
+                            if action.tool == "find_candidate":
                                 policy_state["market"] = tr.get("candidates", [])
-                            if "projects" in tr:
-                                # find_available_projects
+                                policy_state["_last_mkt_refresh"] = policy_state["_step"]
+                            elif action.tool == "find_available_projects":
                                 policy_state["projects"] = tr.get("projects", [])
-                            # After hire/interview/match, refresh candidate list
-                            if action.tool in ("hire_candidate", "interview_candidate",
-                                               "negotiate_salary", "match_candidate_to_project",
-                                               "let_go_candidate"):
-                                policy_state.pop("candidates", None)
+                                policy_state["_last_proj_refresh"] = policy_state["_step"]
+                            elif action.tool == "interview_candidate" and tr.get("success"):
+                                # Move candidate from market cache → candidates (pipeline)
+                                cid = tr.get("candidate_id", "")
+                                interviewed = None
+                                new_market = []
+                                for mc in policy_state.get("market", []):
+                                    if mc.get("id") == cid:
+                                        interviewed = mc
+                                    else:
+                                        new_market.append(mc)
+                                policy_state["market"] = new_market
+                                if interviewed:
+                                    interviewed["status"] = "in_pipeline"
+                                    interviewed["base_rating"] = tr.get("base_rating", 0)
+                                    policy_state.setdefault("candidates", []).append(interviewed)
+                            elif action.tool == "hire_candidate" and tr.get("success"):
+                                # Update candidate status: in_pipeline → hired
+                                cid = tr.get("candidate_id", "")
+                                for c in policy_state.get("candidates", []):
+                                    if c.get("id") == cid:
+                                        c["status"] = "hired"
+                                        c["salary_weekly"] = tr.get("salary_weekly", 0)
+                                        c["composite_rating"] = tr.get("composite_rating", 0)
+                                        break
+                            elif action.tool == "match_candidate_to_project":
+                                cid = action.params.get("candidate_id", "")
+                                rid = action.params.get("role_id", "")
+                                pid = action.params.get("project_id", "")
+                                if tr.get("success"):
+                                    # Update candidate status: hired → placed
+                                    for c in policy_state.get("candidates", []):
+                                        if c.get("id") == cid:
+                                            c["status"] = "placed"
+                                            break
+                                    # Mark role as filled in cached projects
+                                    for p in policy_state.get("projects", []):
+                                        for r in p.get("roles", []):
+                                            if r.get("role_id") == rid:
+                                                r["filled_count"] = r.get("filled_count", 0) + 1
+                                                if r["filled_count"] >= r.get("headcount", 1):
+                                                    r["is_filled"] = True
+                                else:
+                                    err = tr.get("error", "")
+                                    if "not found" in err.lower():
+                                        # Project or role expired — remove stale cache entry
+                                        policy_state["projects"] = [
+                                            p for p in policy_state.get("projects", [])
+                                            if p.get("project_id") != pid
+                                        ]
+                                    else:
+                                        # Track failed match to avoid retrying
+                                        policy_state.setdefault("_failed_matches", set()).add((cid, rid))
+                            elif action.tool == "interview_candidate" and not tr.get("success"):
+                                # Candidate left market — remove from cache
+                                cid_fail = tr.get("candidate_id", "") or action.params.get("candidate_id", "")
+                                policy_state["market"] = [
+                                    mc for mc in policy_state.get("market", [])
+                                    if mc.get("id") != cid_fail
+                                ]
+                            elif action.tool == "let_go_candidate" and tr.get("success"):
+                                cid = tr.get("candidate_id", "")
+                                policy_state["candidates"] = [
+                                    c for c in policy_state.get("candidates", [])
+                                    if c.get("id") != cid
+                                ]
+                            elif action.tool == "pass_on_project" and tr.get("success"):
+                                pid = action.params.get("project_id", "")
+                                policy_state["projects"] = [
+                                    p for p in policy_state.get("projects", [])
+                                    if p.get("project_id") != pid
+                                ]
                         if result.done:
                             break
                     except Exception:
@@ -337,14 +416,38 @@ def dry_run_simulate(env_url: str, num_episodes: int, max_turns: int, seed: int)
 # ---------------------------------------------------------------------------
 
 def _policy_random_http(env, rng, state: dict):
-    """Random: cycle through execute tools that generate signal."""
+    """Random: basic pipeline with random candidate/project selection."""
     from models import StaffingAction
-    # Use only EXECUTE tools so reward accumulates
-    execute_tools = [
-        "find_available_projects",
-        "find_candidate",
-        "get_financial_summary",   # GET — safe fallback
-    ]
+
+    candidates = state.get("candidates", [])
+    projects   = state.get("projects", [])
+    market     = state.get("market", [])
+
+    # Hire anyone in pipeline first
+    for c in candidates:
+        if c.get("status") == "in_pipeline":
+            return StaffingAction(tool="hire_candidate", params={"candidate_id": c["id"]})
+
+    # Try to place a hired candidate into any open role
+    hired = [c for c in candidates if c.get("status") == "hired"]
+    if hired and projects:
+        c = rng.choice(hired)
+        for p in projects:
+            for r in p.get("roles", []):
+                open_role = not r.get("is_filled") if "is_filled" in r else r.get("filled_count", 0) < r.get("headcount", 1)
+                if open_role:
+                    return StaffingAction(
+                        tool="match_candidate_to_project",
+                        params={"candidate_id": c["id"], "project_id": p["project_id"], "role_id": r["role_id"]},
+                    )
+
+    # Interview a random market candidate
+    if market:
+        c = rng.choice(market)
+        return StaffingAction(tool="interview_candidate", params={"candidate_id": c["id"]})
+
+    # Refresh caches
+    execute_tools = ["find_available_projects", "find_candidate"]
     return StaffingAction(tool=rng.choice(execute_tools), params={})
 
 
@@ -352,13 +455,14 @@ def _policy_greedy_http(env, rng, state: dict):
     """
     Greedy: interview → hire → place pipeline.
     Uses cached candidates/projects from policy_state (populated last step).
-    Checks developer_type compatibility before matching.
+    Checks developer_type, skill_score, and seniority compatibility before matching.
     """
     from models import StaffingAction
 
     candidates = state.get("candidates", [])
     projects   = state.get("projects", [])
     market     = state.get("market", [])
+    failed_matches = state.setdefault("_failed_matches", set())
 
     # Adjacency: which candidate types can fill which role types
     ADJACENT = {
@@ -368,50 +472,107 @@ def _policy_greedy_http(env, rng, state: dict):
         "ml_engineer": {"ml_engineer", "backend"},
         "devops":      {"devops"},
     }
+    SEN_ORDER = {"junior": 0, "mid": 1, "senior": 2}
 
-    def can_fill(cand_type: str, role_type: str) -> bool:
+    def role_is_open(r: dict) -> bool:
+        """Check if role is unfilled (handles missing is_filled key)."""
+        if "is_filled" in r:
+            return not r["is_filled"]
+        return r.get("filled_count", 0) < r.get("headcount", 1)
+
+    def can_fill(cand: dict, role: dict) -> bool:
+        """Full compatibility: type + skill + seniority."""
+        cand_type = cand.get("developer_type", "")
+        role_type = role.get("developer_type", "")
+        if role_type not in ADJACENT.get(cand_type, {cand_type}):
+            return False
+        if cand.get("skill_score", 0) < role.get("min_skill_score", 0):
+            return False
+        cand_sen = SEN_ORDER.get(cand.get("seniority_level", "junior"), 0)
+        role_sen = SEN_ORDER.get(role.get("seniority", "junior"), 0)
+        if cand_sen < role_sen:
+            return False
+        return True
+
+    def can_fill_type(cand_type: str, role_type: str) -> bool:
         return role_type in ADJACENT.get(cand_type, {cand_type})
 
+    hired = [c for c in candidates if c.get("status") == "hired"]
+    pipeline = [c for c in candidates if c.get("status") == "in_pipeline"]
+    all_available = hired + pipeline + market
+
+    open_roles = [
+        (p, r) for p in projects for r in p.get("roles", [])
+        if role_is_open(r)
+    ]
+
+    # 0. Proactively PASS on unfillable projects (no satisfaction penalty)
+    step = state.get("_step", 0)
+    stale_offset = max(0, step - state.get("_last_proj_refresh", 0))
+    for p in projects:
+        open_roles_p = [r for r in p.get("roles", []) if role_is_open(r)]
+        if not open_roles_p:
+            continue
+        fillable = all(
+            any(can_fill(c, r) for c in all_available)
+            for r in open_roles_p
+        )
+        deadline_est = max(0, p.get("deadline_remaining", 99) - stale_offset)
+        if not fillable or (deadline_est <= 3 and not any(
+            can_fill(c, r) for c in hired for r in open_roles_p
+        )):
+            return StaffingAction(tool="pass_on_project", params={"project_id": p["project_id"]})
+
     # 1. Hire anyone in pipeline
-    for c in candidates:
-        if c.get("status") == "in_pipeline":
-            return StaffingAction(tool="hire_candidate", params={"candidate_id": c["id"]})
+    for c in pipeline:
+        return StaffingAction(tool="hire_candidate", params={"candidate_id": c["id"]})
 
-    # 2. Place hired candidate into first type-compatible open role
-    for c in candidates:
-        if c.get("status") == "hired":
-            for p in projects:
-                for r in p.get("roles", []):
-                    if (not r.get("is_filled")
-                            and can_fill(c.get("developer_type", ""), r.get("developer_type", ""))):
-                        return StaffingAction(
-                            tool="match_candidate_to_project",
-                            params={
-                                "candidate_id": c["id"],
-                                "project_id":   p["project_id"],
-                                "role_id":      r["role_id"],
-                            },
-                        )
+    # 2. Place hired candidate into first compatible open role (skip failed pairs)
+    for c in hired:
+        for p, r in open_roles:
+            pair_key = (c["id"], r["role_id"])
+            if can_fill(c, r) and pair_key not in failed_matches:
+                return StaffingAction(
+                    tool="match_candidate_to_project",
+                    params={
+                        "candidate_id": c["id"],
+                        "project_id":   p["project_id"],
+                        "role_id":      r["role_id"],
+                    },
+                )
 
-    # 3. Interview market candidate whose type matches an open role
-    needed_types = {
-        r.get("developer_type")
-        for p in projects for r in p.get("roles", [])
-        if not r.get("is_filled")
-    }
-    for c in market:
-        if can_fill(c.get("developer_type", ""), next(iter(needed_types), "")):
-            return StaffingAction(tool="interview_candidate", params={"candidate_id": c["id"]})
-    if market and needed_types:
-        # Interview anyone who can fill any needed type
-        for c in market:
-            for nt in needed_types:
-                if can_fill(c.get("developer_type", ""), nt):
-                    return StaffingAction(tool="interview_candidate", params={"candidate_id": c["id"]})
+    # 3. Let go of bench candidates with no matching open roles (stop burn)
+    for c in hired:
+        placeable = any(
+            can_fill(c, r) and (c["id"], r["role_id"]) not in failed_matches
+            for _p, r in open_roles
+        )
+        if not placeable:
+            return StaffingAction(tool="let_go_candidate", params={"candidate_id": c["id"]})
 
-    # 4. Refresh cache
-    if not projects:
+    # 4. Interview market candidate whose type matches an open role
+    for mc in market:
+        for _p, r in open_roles:
+            if can_fill(mc, r):
+                return StaffingAction(tool="interview_candidate", params={"candidate_id": mc["id"]})
+
+    # 5. Refresh stale caches — ALTERNATE between projects and market
+    step = state.get("_step", 0)
+    proj_age = step - state.get("_last_proj_refresh", -99)
+    mkt_age = step - state.get("_last_mkt_refresh", -99)
+    # Always alternate: never call the same refresh twice in a row
+    last_refresh = state.get("_last_refresh_tool", "")
+    if last_refresh == "find_available_projects":
+        state["_last_refresh_tool"] = "find_candidate"
+        return StaffingAction(tool="find_candidate", params={})
+    if last_refresh == "find_candidate":
+        state["_last_refresh_tool"] = "find_available_projects"
         return StaffingAction(tool="find_available_projects", params={})
+    # First refresh — prefer whichever is older
+    if proj_age >= mkt_age:
+        state["_last_refresh_tool"] = "find_available_projects"
+        return StaffingAction(tool="find_available_projects", params={})
+    state["_last_refresh_tool"] = "find_candidate"
     return StaffingAction(tool="find_candidate", params={})
 
 
@@ -419,12 +580,14 @@ def _policy_optimal_http(env, rng, state: dict):
     """
     Demand-aware optimal: target easiest-to-seal projects (fewest unfilled roles),
     only hire types that match open roles, place immediately, pass expiring unwinnable projects.
+    Full skill/seniority compatibility checks to avoid wasted match attempts.
     """
     from models import StaffingAction
 
     candidates = state.get("candidates", [])
     projects   = state.get("projects", [])
     market     = state.get("market", [])
+    failed_matches = state.setdefault("_failed_matches", set())
 
     ADJACENT = {
         "backend":     {"backend", "fullstack", "ml_engineer"},
@@ -433,76 +596,124 @@ def _policy_optimal_http(env, rng, state: dict):
         "ml_engineer": {"ml_engineer", "backend"},
         "devops":      {"devops"},
     }
+    SEN_ORDER = {"junior": 0, "mid": 1, "senior": 2}
 
-    def can_fill(cand_type: str, role_type: str) -> bool:
+    def role_is_open(r: dict) -> bool:
+        if "is_filled" in r:
+            return not r["is_filled"]
+        return r.get("filled_count", 0) < r.get("headcount", 1)
+
+    def can_fill(cand: dict, role: dict) -> bool:
+        """Full compatibility: type + skill + seniority."""
+        cand_type = cand.get("developer_type", "")
+        role_type = role.get("developer_type", "")
+        if role_type not in ADJACENT.get(cand_type, {cand_type}):
+            return False
+        if cand.get("skill_score", 0) < role.get("min_skill_score", 0):
+            return False
+        cand_sen = SEN_ORDER.get(cand.get("seniority_level", "junior"), 0)
+        role_sen = SEN_ORDER.get(role.get("seniority", "junior"), 0)
+        if cand_sen < role_sen:
+            return False
+        return True
+
+    def can_fill_type(cand_type: str, role_type: str) -> bool:
         return role_type in ADJACENT.get(cand_type, {cand_type})
 
-    # Sort projects: fewest unfilled roles first (easiest to seal = fastest revenue)
-    def unfilled_count(p):
-        return sum(1 for r in p.get("roles", []) if not r.get("is_filled"))
+    # Estimate deadline staleness: cached deadline - steps since last project refresh
+    step = state.get("_step", 0)
+    proj_refresh_step = state.get("_last_proj_refresh", 0)
+    stale_offset = max(0, step - proj_refresh_step)
 
-    sorted_projects = sorted(projects, key=unfilled_count)
+    def est_deadline(p: dict) -> int:
+        return max(0, p.get("deadline_remaining", 99) - stale_offset)
+
+    # Sort projects: most deadline remaining first (safest to fill)
+    sorted_projects = sorted(projects, key=est_deadline, reverse=True)
 
     # Build demand from open roles
+    open_roles_all = []
     demand: dict[str, int] = {}
-    urgent_ids: list[str] = []
     for p in sorted_projects:
         for r in p.get("roles", []):
-            if not r.get("is_filled"):
+            if role_is_open(r):
                 dt = r.get("developer_type", "")
                 demand[dt] = demand.get(dt, 0) + 1
-        if p.get("deadline_remaining", 99) <= 3:
-            urgent_ids.append(p["project_id"])
+                open_roles_all.append((p, r))
 
     hired = [c for c in candidates if c.get("status") == "hired"]
     pipeline = [c for c in candidates if c.get("status") == "in_pipeline"]
+    all_available = hired + pipeline + market  # all candidates we might use
 
-    # 1. Place any hired candidate into best matching open role (easiest project first)
-    for p in sorted_projects:
-        for r in p.get("roles", []):
-            if r.get("is_filled"):
-                continue
-            role_type = r.get("developer_type", "")
-            for c in hired:
-                if can_fill(c.get("developer_type", ""), role_type):
-                    return StaffingAction(
-                        tool="match_candidate_to_project",
-                        params={
-                            "candidate_id": c["id"],
-                            "project_id":   p["project_id"],
-                            "role_id":      r["role_id"],
-                        },
-                    )
+    # 0. Proactively PASS on unfillable projects (prevents expiry penalties + churn)
+    #    pass_on_project has NO satisfaction penalty — it just removes the project
+    for p in list(sorted_projects):
+        open_roles_p = [r for r in p.get("roles", []) if role_is_open(r)]
+        if not open_roles_p:
+            continue
+        # Can any available candidate (hired, pipeline, market) fill each open role?
+        fillable = all(
+            any(can_fill(c, r) for c in all_available)
+            for r in open_roles_p
+        )
+        deadline_est = est_deadline(p)
+        # Pass if: no compatible candidate exists, OR deadline too tight to pipeline
+        if not fillable or (deadline_est <= 3 and not any(
+            can_fill(c, r) for c in hired for r in open_roles_p
+        )):
+            return StaffingAction(tool="pass_on_project", params={"project_id": p["project_id"]})
+
+    # 1. Place any hired candidate into best matching open role
+    for p, r in open_roles_all:
+        for c in hired:
+            pair_key = (c["id"], r["role_id"])
+            if can_fill(c, r) and pair_key not in failed_matches:
+                return StaffingAction(
+                    tool="match_candidate_to_project",
+                    params={
+                        "candidate_id": c["id"],
+                        "project_id":   p["project_id"],
+                        "role_id":      r["role_id"],
+                    },
+                )
 
     # 2. Hire pipeline candidates whose type is needed
     for c in pipeline:
-        if any(can_fill(c.get("developer_type", ""), dt) for dt in demand):
+        if any(can_fill_type(c.get("developer_type", ""), dt) for dt in demand):
             return StaffingAction(tool="hire_candidate", params={"candidate_id": c["id"]})
 
-    # 3. Pass on urgent projects we definitely can't fill (no hired match)
-    hired_types = {c.get("developer_type") for c in hired}
-    for p in sorted_projects:
-        if p["project_id"] in urgent_ids:
-            needs = {r.get("developer_type") for r in p.get("roles", []) if not r.get("is_filled")}
-            fillable = any(
-                any(can_fill(ht, nt) for nt in needs)
-                for ht in hired_types
-            )
-            if not fillable:
-                return StaffingAction(tool="pass_on_project", params={"project_id": p["project_id"]})
+    # 3. Let go of bench candidates with no matching open roles (stop burn)
+    for c in hired:
+        placeable = any(
+            can_fill(c, r) and (c["id"], r["role_id"]) not in failed_matches
+            for _p, r in open_roles_all
+        )
+        if not placeable:
+            return StaffingAction(tool="let_go_candidate", params={"candidate_id": c["id"]})
 
-    # 4. Interview market candidate matching demand (highest skill first)
+    # 5. Interview market candidate matching demand (highest skill first)
     market_sorted = sorted(market, key=lambda c: c.get("skill_score", 0), reverse=True)
-    for c in market_sorted:
-        if any(can_fill(c.get("developer_type", ""), dt) for dt in demand):
-            return StaffingAction(tool="interview_candidate", params={"candidate_id": c["id"]})
+    for mc in market_sorted:
+        for _p, r in open_roles_all:
+            if can_fill(mc, r):
+                return StaffingAction(tool="interview_candidate", params={"candidate_id": mc["id"]})
 
-    # 5. Refresh cache: prefer projects if empty, else candidates
-    if not projects:
-        return StaffingAction(tool="find_available_projects", params={})
-    if not market:
+    # 6. Refresh stale caches — ALTERNATE between projects and market
+    step = state.get("_step", 0)
+    proj_age = step - state.get("_last_proj_refresh", -99)
+    mkt_age = step - state.get("_last_mkt_refresh", -99)
+    last_refresh = state.get("_last_refresh_tool", "")
+    if last_refresh == "find_available_projects":
+        state["_last_refresh_tool"] = "find_candidate"
         return StaffingAction(tool="find_candidate", params={})
-    return StaffingAction(tool="find_available_projects", params={})
+    if last_refresh == "find_candidate":
+        state["_last_refresh_tool"] = "find_available_projects"
+        return StaffingAction(tool="find_available_projects", params={})
+    if proj_age >= mkt_age:
+        state["_last_refresh_tool"] = "find_available_projects"
+        return StaffingAction(tool="find_available_projects", params={})
+    state["_last_refresh_tool"] = "find_candidate"
+    return StaffingAction(tool="find_candidate", params={})
 
 
 def _plot_reward_curves(results: dict, n_episodes: int):

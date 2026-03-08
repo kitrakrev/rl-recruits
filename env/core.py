@@ -105,7 +105,7 @@ class StaffingCore:
             for role in project.roles:
                 unfilled = role.headcount - role.filled_count
                 if unfilled > 0:
-                    penalty = unfilled * (85_000 / 52) * 1.25
+                    penalty = unfilled * (85_000 / 52) * 1.25 * project.deadline_remaining
                     reward -= penalty
                     self.costs += penalty
             # Keep consistent format for expired projects (store dicts)
@@ -180,7 +180,7 @@ class StaffingCore:
             for role in project.roles:
                 unfilled = role.headcount - role.filled_count
                 if unfilled > 0:
-                    penalty = unfilled * (85_000 / 52) * 1.25
+                    penalty = unfilled * (85_000 / 52) * 1.25 * project.deadline_remaining
                     reward -= penalty
                     self.costs += penalty
             # Keep consistent format for expired projects (store dicts)

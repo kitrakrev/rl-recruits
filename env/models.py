@@ -65,7 +65,9 @@ class Role:
         return self.filled_count >= self.headcount
 
     def to_dict(self) -> dict:
-        return self.__dict__.copy()
+        d = self.__dict__.copy()
+        d["is_filled"] = self.is_filled   # include @property for clients
+        return d
 
 
 @dataclass
