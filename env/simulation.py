@@ -15,6 +15,17 @@ if TYPE_CHECKING:
     from .llm import LLMRouter
 
 
+_counters: dict[str, int] = {}
+
+def _reset_counters() -> None:
+    """Call at env reset so each episode gets fresh sequential IDs starting from 1."""
+    _counters.clear()
+
+def _next_id(prefix: str) -> str:
+    n = _counters.get(prefix, 0) + 1
+    _counters[prefix] = n
+    return f"{prefix}{n}"
+
 def _uid() -> str:
     return str(uuid.uuid4())[:8]
 
@@ -48,7 +59,7 @@ def generate_candidate(config: "Config", rng: random.Random) -> Candidate:
     patience = config.t_patience + rng.randint(-2, 2)
     patience = max(4, patience)
 
-    cid = f"C-{dev_type[:2].upper()}-{_uid()}"
+    cid = _next_id("C")
     return Candidate(
         id=cid,
         developer_type=dev_type,
@@ -67,7 +78,7 @@ def generate_candidate(config: "Config", rng: random.Random) -> Candidate:
 # ---------------------------------------------------------------------------
 
 def generate_project(client: Client, config: "Config", rng: random.Random) -> Project:
-    pid = f"P-{client.client_id[:3]}-{_uid()}"
+    pid = _next_id("P")
     deadline = rng.randint(config.t_deadline_min, config.t_deadline_max)
     n_roles = rng.randint(1, config.max_roles_per_project)
 
@@ -77,7 +88,7 @@ def generate_project(client: Client, config: "Config", rng: random.Random) -> Pr
 
     roles = []
     for i in range(n_roles):
-        rid = f"R-{pid}-{i}"
+        rid = f"R{pid[1:]}-{i}"  # e.g. P3 → R3-0, R3-1
         dev_type = rng.choice(config.developer_types)
         if config.curriculum_stage == 1:
             dev_type = config.developer_types[0]
@@ -119,7 +130,7 @@ def generate_project(client: Client, config: "Config", rng: random.Random) -> Pr
 
 def generate_client(client_idx: int, config: "Config", rng: random.Random) -> Client:
     industry = rng.choice(config.industries)
-    cid = f"CL-{industry[:3].upper()}-{client_idx:02d}"
+    cid = f"CL{client_idx + 1}"
     return Client(
         client_id=cid,
         industry=industry,
@@ -320,37 +331,57 @@ def replenish_market(
 # Matching helpers
 # ---------------------------------------------------------------------------
 
+_SKILL_TOLERANCE = 0.20  # allow up to 20% below min_skill_score
+
 def compute_match_score(
     candidate: Candidate,
     role: Role,
     config: "Config",
 ) -> float:
-    """Return match score 0.0–1.0; 0.0 means illegal (blocked)."""
+    """Return match score 0.0–1.0; 0.0 means hard-blocked (only on type mismatch)."""
     adjacent_types = config.adjacency.get(candidate.developer_type, set())
 
-    # Type check
+    # Only hard-block on type — all other mismatches reduce score but don't block
     if role.developer_type not in adjacent_types:
-        return 0.0  # illegal
+        return 0.0
 
-    # Skill check
-    if candidate.skill_score < role.min_skill_score:
-        return 0.0  # illegal
+    # Skill below floor (after 20% tolerance) → soft penalty, not a block
+    effective_min = role.min_skill_score * (1 - _SKILL_TOLERANCE)
+    skill_ok = candidate.skill_score >= effective_min
+    skill_penalty = 0.0 if skill_ok else 0.15  # score reduction if below tolerance
 
-    # Seniority compatibility
-    sen_ok = _seniority_ok(candidate.seniority_level, role.seniority)
-    if not sen_ok:
-        return 0.0  # illegal
+    # Seniority mismatch reduces score but no longer blocks
+    seniority_penalty = 0.0 if _seniority_ok(candidate.seniority_level, role.seniority) else 0.15
 
-    # Score breakdown
-    exact_type = candidate.developer_type == role.developer_type
+    exact_type      = candidate.developer_type == role.developer_type
     exact_seniority = candidate.seniority_level == role.seniority
 
     if exact_type and exact_seniority:
-        return 1.0
+        base = 1.0
     elif not exact_type:
-        return 0.7   # adjacent type
+        base = 0.7   # adjacent type
     else:
-        return 0.85  # seniority mismatch (overqualified)
+        base = 0.85  # seniority overqualified
+
+    return max(0.3, base - skill_penalty - seniority_penalty)
+
+
+def diagnose_match_failure(
+    candidate: Candidate,
+    role: Role,
+    config: "Config",
+) -> str:
+    """Return a precise failure message. Only called when compute_match_score == 0 (type block)."""
+    adjacent_types = config.adjacency.get(candidate.developer_type, set())
+    if role.developer_type not in adjacent_types:
+        return (
+            f"TYPE MISMATCH: candidate '{candidate.id}' is type='{candidate.developer_type}'. "
+            f"Role '{role.role_id}' requires type='{role.developer_type}' (or adjacent). "
+            f"Valid types for this candidate: {sorted(adjacent_types)}. "
+            f"Find a role that needs '{candidate.developer_type}', or hire a '{role.developer_type}' candidate."
+        )
+    # Should not reach here since only type=0 triggers hard block now
+    return f"Match blocked for candidate '{candidate.id}' on role '{role.role_id}'."
 
 
 def _seniority_ok(candidate_sen: str, role_sen: str) -> bool:

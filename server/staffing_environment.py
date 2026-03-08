@@ -63,7 +63,8 @@ class StaffingAgencyEnvironment(MCPEnvironment):
     _PASSIVE_TOOLS = frozenset({
         "get_agency_state", "get_client_state", "get_candidate_state",
         "get_project_details", "get_candidate_profile",
-        "get_market_demand", "get_financial_summary",
+        "get_market_demand", "get_financial_summary", "get_candidate_types",
+        "find_available_projects",
     })
 
     # Canonical valid arguments per tool. Any extra args the LLM hallucinates
@@ -75,7 +76,8 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         "get_candidate_state":       frozenset(),
         "get_financial_summary":     frozenset(),
         "get_market_demand":         frozenset(),
-        "find_candidate":            frozenset({"developer_type"}),
+        "get_candidate_types":       frozenset(),
+        "find_candidate":            frozenset({"developer_type", "seniority_level", "min_skill_score", "min_composite_rating"}),
         "interview_candidate":       frozenset({"candidate_id"}),
         "hire_candidate":            frozenset({"candidate_id"}),
         "negotiate_salary":          frozenset({"candidate_id", "offer_weekly"}),
@@ -109,6 +111,7 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         self._state = StaffingState()
         self._passive_streak: int = 0   # consecutive GET-only turns this episode
         self._last_tool: str = ""        # last tool called, for repeat detection
+        self._last_tool_failed: bool = False  # was the last call a failure?
 
         # Reward capture: each MCP tool wrapper stores its reward here before
         # stripping the "reward" key from the dict it returns to the agent.
@@ -140,6 +143,7 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             raise
         self._passive_streak = 0
         self._last_tool = ""
+        self._last_tool_failed = False
         self._last_tool_reward = 0.0
         episode_id = episode_id or str(uuid4())
         self._state = StaffingState(
@@ -168,7 +172,7 @@ class StaffingAgencyEnvironment(MCPEnvironment):
     _GET_TOOLS = frozenset({
         "get_agency_state", "get_client_state", "get_candidate_state",
         "get_project_details", "get_candidate_profile",
-        "get_market_demand", "get_financial_summary",
+        "get_market_demand", "get_financial_summary", "get_candidate_types",
         "_override_cash", "_override_satisfaction",
     })
 
@@ -210,6 +214,13 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         # Let MCPEnvironment route and execute the tool call
         obs = super().step(action, timeout_s=timeout_s, **kwargs)
 
+        # Track whether this call failed (so we can waive the repeat penalty on retry)
+        tr = obs.tool_result if hasattr(obs, "tool_result") else {}
+        if isinstance(tr, dict):
+            self._last_tool_failed = not tr.get("success", True)
+        else:
+            self._last_tool_failed = False
+
         # Sync state with core after action (tool might have changed cash/etc)
         self._state.step_count = self.core.step_count
         self._state.cash = self.core.cash
@@ -219,15 +230,17 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         # Capture the tool's own reward (set by each wrapper into _last_tool_reward)
         tool_reward = self._last_tool_reward
 
-        # Repeat-call penalty: penalize calling the same tool twice in a row
+        # Repeat-call penalty: skip if the PREVIOUS call of the same tool failed
+        # (retrying after a genuine failure is correct behaviour, not spam).
         tool_name = action.tool_name if hasattr(action, "tool_name") else ""
         repeat_penalty = 0.0
-        if tool_name and tool_name == self._last_tool and tool_name not in self._GET_TOOLS:
+        if (tool_name and tool_name == self._last_tool
+                and tool_name not in self._GET_TOOLS
+                and not self._last_tool_failed):
             repeat_penalty = self._config.repeat_call_penalty
-            self.core.costs += abs(repeat_penalty)
         self._last_tool = tool_name
 
-        # Passive-streak penalty: discourage consecutive GET-only turns
+        # Passive-streak penalty: same — shaping only, not a business cost
         if tool_name in self._PASSIVE_TOOLS:
             self._passive_streak += 1
         else:
@@ -236,10 +249,6 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         passive_penalty = 0.0
         if self._passive_streak > self._config.passive_streak_threshold:
             passive_penalty = self._config.passive_streak_penalty
-            self.core.costs += abs(passive_penalty)
-
-        # Re-sync costs after penalties
-        self._state.costs = self.core.costs
 
         total_reward = tool_reward + passive_penalty + repeat_penalty
         self._state.cumulative_reward += total_reward
@@ -381,25 +390,98 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             return res
 
         @mcp.tool()
-        def find_candidate(developer_type: str = "") -> dict:
-            r = env.core.tool_find_candidate(developer_type)
-            return {"candidates": r["candidates"], "count": r["count"]}
+        def get_candidate_types() -> dict:
+            """Return the valid developer_type and seniority_level values accepted by find_candidate, plus score ranges."""
+            return env.core.tool_get_candidate_types()
+
+        @mcp.tool()
+        def find_candidate(
+            developer_type: str = "",
+            seniority_level: str = "",
+            min_skill_score: float = 0.0,
+            min_composite_rating: float = 0.0,
+        ) -> dict:
+            """Search the market. All filters optional and combinable."""
+            r = env.core.tool_find_candidate(
+                developer_type, seniority_level, min_skill_score, min_composite_rating
+            )
+            result = {"candidates": r["candidates"], "count": r["count"]}
+            if r["count"] == 0:
+                # Show what types are actually available so model can adjust filter
+                from collections import Counter
+                type_counts = Counter(c.developer_type for c in env.core.market)
+                result["no_results_reason"] = (
+                    f"No candidates match filters: developer_type='{developer_type}' "
+                    f"seniority='{seniority_level}' min_skill={min_skill_score}."
+                )
+                result["available_types_in_market"] = dict(type_counts)
+                result["fix"] = "Adjust your filters to match one of the types above, or call find_candidate() with no filters."
+            return result
 
         @mcp.tool()
         def interview_candidate(candidate_id: str) -> dict:
             """Screen a candidate: costs $500, reveals skill + salary expectation."""
             res = env.core.tool_interview_candidate(candidate_id)
-            # REWARD FIX: capture -$500 interview cost before stripping from agent view
             env._last_tool_reward = float(res.pop("reward", 0.0))
-            res.pop("result", None)   # legacy RL wrapper field
+            res.pop("result", None)
+            if not res.get("success", True):
+                # Show available market candidates so model can pick a real one
+                market = [
+                    {"id": c.id, "type": c.developer_type, "seniority": c.seniority_level}
+                    for c in env.core.market[:10]
+                ]
+                res["reason"] = (
+                    f"Candidate '{candidate_id}' is not in the market "
+                    f"(already hired, placed, or ID is wrong)."
+                )
+                res["available_in_market"] = market
+                res["fix"] = "Use one of the candidate IDs from 'available_in_market' above."
             return res
 
         @mcp.tool()
         def hire_candidate(candidate_id: str) -> dict:
             """Hire an interviewed candidate: costs $2,000 onboarding."""
             res = env.core.tool_hire_candidate(candidate_id)
-            # REWARD FIX: capture -$2,000 onboarding cost
             env._last_tool_reward = float(res.pop("reward", 0.0))
+
+            if not res.get("success", True):
+                market = [{"id": c.id, "type": c.developer_type, "seniority": c.seniority_level}
+                          for c in env.core.market[:10]]
+                res["reason"] = f"Candidate '{candidate_id}' not found or not ready to hire (wrong status/ID)."
+                res["available_in_market"] = market
+                res["fix"] = "Call find_candidate() to get fresh IDs, then interview before hiring."
+                return res
+
+            # Attach compatible open roles so the model can match immediately
+            if res.get("hired"):
+                hired_type  = res.get("developer_type", "")
+                hired_skill = res.get("composite_rating", 0.0)
+                compatible = []
+                for cl in env.core.clients:
+                    for proj in cl.projects:
+                        if proj.fill_status == "SEALED":
+                            continue
+                        for role in proj.roles:
+                            if (not role.is_filled
+                                    and role.developer_type == hired_type
+                                    and hired_skill >= role.min_skill_score):
+                                compatible.append({
+                                    "project_id": proj.project_id,
+                                    "role_id":    role.role_id,
+                                    "needs_type": role.developer_type,
+                                    "min_skill":  role.min_skill_score,
+                                    "bill_rate_weekly": role.bill_rate_weekly,
+                                })
+                if compatible:
+                    res["next_step"] = (
+                        f"Call confirm_project then match_candidate_to_project using one of these "
+                        f"compatible '{hired_type}' roles: {compatible[:4]}"
+                    )
+                else:
+                    res["next_step"] = (
+                        f"No open '{hired_type}' roles right now. "
+                        "Call get_client_state to find new projects or advance_week."
+                    )
             return res
 
         @mcp.tool()
@@ -412,16 +494,61 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         def match_candidate_to_project(candidate_id: str, project_id: str, role_id: str) -> dict:
             """Place a candidate on a role. Speed bonus if project sealed within 2 weeks."""
             res = env.core.tool_match_candidate_to_project(candidate_id, project_id, role_id)
-            # REWARD FIX: capture speed-seal bonus (0 for most placements, small bonus for fast seals)
             env._last_tool_reward = float(res.pop("reward", 0.0))
+            if not res.get("success", True):
+                err = res.get("error", "")
+                # Type/skill mismatch: show what the candidate has vs what the role needs
+                if "type mismatch" in err.lower() or "insufficient skill" in err.lower():
+                    c_type  = res.get("candidate_type", "?")
+                    r_type  = res.get("role_type", "?")
+                    c_skill = res.get("candidate_skill", "?")
+                    r_skill = res.get("role_min_skill", "?")
+                    # Suggest open roles that DO match the candidate's type
+                    matching_roles = [
+                        {"project_id": p.project_id, "role_id": ro.role_id,
+                         "needs": ro.developer_type, "min_skill": ro.min_skill_score,
+                         "bill_rate": ro.bill_rate_weekly}
+                        for cl in env.core.clients for p in cl.projects
+                        if p.fill_status != "SEALED"
+                        for ro in p.roles
+                        if not ro.is_filled and ro.developer_type == c_type
+                    ]
+                    res["reason"] = (
+                        f"Your candidate '{candidate_id}' is type='{c_type}' skill={c_skill}. "
+                        f"Role '{role_id}' needs type='{r_type}' min_skill={r_skill}. Types must match exactly."
+                    )
+                    res["roles_matching_your_candidate"] = matching_roles[:5]
+                    res["fix"] = (
+                        f"Use a role from 'roles_matching_your_candidate' that needs '{c_type}'. "
+                        f"If none listed, call find_candidate(developer_type='{r_type}') to hire the right type."
+                    )
+                # Project or role not found
+                elif "not found" in err.lower() or "invalid" in err.lower():
+                    open_projects = [
+                        {"project_id": p.project_id, "client_id": cl.client_id,
+                         "roles": [{"role_id": ro.role_id, "needs": ro.developer_type}
+                                   for ro in p.roles if not ro.is_filled]}
+                        for cl in env.core.clients for p in cl.projects
+                        if p.fill_status != "SEALED"
+                    ]
+                    res["reason"] = f"project_id='{project_id}' or role_id='{role_id}' does not exist."
+                    res["open_projects"] = open_projects[:5]
+                    res["fix"] = "Use project_id and role_id from 'open_projects' above — never invent IDs."
             return res
 
         @mcp.tool()
         def let_go_candidate(candidate_id: str) -> dict:
             """Release a candidate: costs 2× weekly salary as severance."""
             res = env.core.tool_let_go_candidate(candidate_id)
-            # REWARD FIX: capture -severance cost
             env._last_tool_reward = float(res.pop("reward", 0.0))
+            if not res.get("success", True):
+                hired = [{"id": c.id, "type": c.developer_type, "status": c.status,
+                          "salary_weekly": round(c.salary_weekly, 2)}
+                         for c in env.core.candidates.values()
+                         if c.status in ("hired", "in_pipeline")]
+                res["reason"] = f"Candidate '{candidate_id}' not found in your roster."
+                res["your_hired_candidates"] = hired
+                res["fix"] = "Use an ID from 'your_hired_candidates'. Call get_candidate_state() to refresh."
             return res
 
         @mcp.tool()

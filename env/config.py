@@ -69,13 +69,13 @@ class Config:
     # --- Legacy Rating tiers (to be removed once core.py is updated) ---
     rating_tiers: list = field(default_factory=list)
 
-    # --- Developer type adjacency ---
+    # --- Developer type adjacency (relaxed: more cross-type placements allowed) ---
     adjacency: dict = field(default_factory=lambda: {
-        "backend":     {"backend", "fullstack", "ml_engineer"},
-        "frontend":    {"frontend", "fullstack"},
-        "fullstack":   {"fullstack", "backend", "frontend"},
-        "ml_engineer": {"ml_engineer", "backend"},
-        "devops":      {"devops"},
+        "backend":     {"backend", "fullstack", "ml_engineer", "devops"},
+        "frontend":    {"frontend", "fullstack", "backend"},
+        "fullstack":   {"fullstack", "backend", "frontend", "ml_engineer", "devops"},
+        "ml_engineer": {"ml_engineer", "backend", "fullstack"},
+        "devops":      {"devops", "backend", "fullstack"},
     })
 
     developer_types: list = field(default_factory=lambda: [

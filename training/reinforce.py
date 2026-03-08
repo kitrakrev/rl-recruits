@@ -168,6 +168,9 @@ def train_grpo(cfg: "TrainingConfig") -> None:
 
         # Filter out auto-advance placeholders (empty prompt/completion)
         valid = [(p, c, r) for p, c, r in zip(prompts, completions, step_rewards) if p]
+        print(f"\n  [Phase2] total steps={len(step_rewards)}  valid={len(valid)}  "
+              f"raw_rewards min={min(step_rewards):.2f} max={max(step_rewards):.2f} "
+              f"sum={sum(step_rewards):.2f}")
         if not valid:
             print(f"  [!] Episode {ep} produced 0 valid steps — skipping.")
             continue
@@ -185,22 +188,34 @@ def train_grpo(cfg: "TrainingConfig") -> None:
         returns_t   = torch.tensor(returns, dtype=torch.float32)
         advantages  = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
 
+        print(f"  [Phase2] returns  min={returns_t.min():.2f} max={returns_t.max():.2f} mean={returns_t.mean():.2f}")
+        print(f"  [Phase2] advantages min={advantages.min():.4f} max={advantages.max():.4f} "
+              f"std={advantages.std():.4f}  nonzero={int((advantages.abs() > 1e-6).sum())}/{n_steps}")
+
         # ---- Phase 3: REINFORCE policy gradient update -------------------
+        print(f"\n  [Phase3] Starting policy update — {n_steps} steps, "
+              f"batch_size={cfg.train_batch_size}")
         model.train()
         indices = list(range(n_steps))
         random.shuffle(indices)
 
         ep_loss_sum = ep_kl_sum = 0.0
         n_batches = 0
+        skipped = 0
 
         for batch_start in range(0, len(indices), cfg.train_batch_size):
             batch_idx  = indices[batch_start : batch_start + cfg.train_batch_size]
-            batch_loss = torch.tensor(0.0, device=model.device)
+            batch_loss = torch.tensor(0.0, requires_grad=False, device=model.device)
+            batch_terms = 0
 
             for idx in batch_idx:
                 prompt_str     = prompts_v[idx]
                 completion_str = completions_v[idx]
                 adv            = advantages[idx].item()
+
+                if not completion_str.strip():
+                    skipped += 1
+                    continue
 
                 prompt_ids = tokenizer(
                     prompt_str,
@@ -218,6 +233,7 @@ def train_grpo(cfg: "TrainingConfig") -> None:
 
                 comp_start = prompt_ids.shape[1]
                 if full_ids.shape[1] <= comp_start:
+                    skipped += 1
                     continue  # completion was entirely truncated
 
                 completion_ids = full_ids[:, comp_start:]
@@ -229,7 +245,6 @@ def train_grpo(cfg: "TrainingConfig") -> None:
                 avg_log_p = tok_lp.mean()
 
                 # Reference log-probs: base model = disable LoRA adapters temporarily.
-                # This avoids loading a second full-size model copy.
                 with torch.no_grad(), model.disable_adapter():
                     ref_logits = model(full_ids).logits[:, comp_start - 1 : -1, :]
                     ref_log_p  = F.log_softmax(ref_logits, dim=-1)
@@ -241,15 +256,42 @@ def train_grpo(cfg: "TrainingConfig") -> None:
 
                 step_loss  = -adv * avg_log_p + cfg.kl_coeff * kl
                 batch_loss = batch_loss + step_loss / len(batch_idx)
+                batch_terms += 1
 
+            if batch_terms == 0:
+                print(f"  [Phase3] batch {n_batches} skipped (all truncated)")
+                continue
+
+            pre_grad_check = batch_loss.requires_grad
             batch_loss.backward()
+
+            # Gradient norm across all trainable params
+            total_norm = sum(
+                p.grad.data.norm(2).item() ** 2
+                for p in model.parameters()
+                if p.grad is not None
+            ) ** 0.5
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad()
 
-            ep_loss_sum += batch_loss.item()
-            all_losses.append(batch_loss.item())
+            loss_val = batch_loss.item()
+            ep_loss_sum += loss_val
+            all_losses.append(loss_val)
             n_batches += 1
+
+            print(f"  [Phase3] batch {n_batches:3d}  terms={batch_terms}  "
+                  f"loss={loss_val:+.6f}  grad_norm={total_norm:.4f}  "
+                  f"requires_grad={pre_grad_check}")
+
+            if wb_run is not None:
+                wb_run.log({
+                    "batch/loss":      loss_val,
+                    "batch/grad_norm": total_norm,
+                    "batch/kl":        ep_kl_sum / max(1, (batch_start + len(batch_idx))),
+                    "episode":         ep,
+                })
 
         avg_ep_loss = ep_loss_sum / max(1, n_batches)
         avg_ep_kl   = ep_kl_sum   / max(1, n_steps)
@@ -259,12 +301,11 @@ def train_grpo(cfg: "TrainingConfig") -> None:
         all_env_rewards.append(cumulative_env_reward)
 
         print(
-            f"  Episode {ep:4d}/{cfg.num_episodes}  "
+            f"\n  === Episode {ep:4d}/{cfg.num_episodes}  "
             f"profit=${final_profit:>10,.0f}  "
             f"env_reward={cumulative_env_reward:+10,.2f}  "
-            f"steps={n_steps}  "
-            f"loss={avg_ep_loss:.4f}  "
-            f"kl={avg_ep_kl:.4f}"
+            f"steps={n_steps}  skipped={skipped}  batches={n_batches}  "
+            f"loss={avg_ep_loss:.6f}  kl={avg_ep_kl:.6f} ==="
         )
 
         if wb_run is not None:
@@ -275,8 +316,13 @@ def train_grpo(cfg: "TrainingConfig") -> None:
                 "loss":            avg_ep_loss,
                 "kl":              avg_ep_kl,
                 "rollout_steps":   n_steps,
+                "skipped_steps":   skipped,
+                "n_batches":       n_batches,
                 "mean_advantage":  advantages.mean().item(),
                 "std_advantage":   advantages.std().item(),
+                "return_mean":     returns_t.mean().item(),
+                "return_min":      returns_t.min().item(),
+                "return_max":      returns_t.max().item(),
             })
 
     # ------------------------------------------------------------------

@@ -101,8 +101,16 @@ def rollout_full_episode(
     except Exception:
         pass
     try:
-        r = env.step(StaffingAction(tool="get_client_state", params={}))
-        init_state["clients"] = r.observation.tool_result or {}
+        r = env.step(StaffingAction(tool="find_available_projects", params={}))
+        raw = r.observation.tool_result or {}
+        # Compact project list: show only what the model needs to plan hiring
+        init_state["open_projects"] = [
+            {"project_id": p.get("project_id"), "deadline_week": p.get("deadline_week"),
+             "roles": [{"role_id": ro.get("role_id"), "type": ro.get("developer_type"),
+                        "min_skill": ro.get("min_skill_score"), "bill_rate": ro.get("bill_rate_weekly")}
+                       for ro in p.get("roles", []) if not ro.get("is_filled")]}
+            for p in raw.get("projects", [])[:6]
+        ]
     except Exception:
         pass
 
@@ -190,14 +198,43 @@ def rollout_full_episode(
                     final_profit = float(result.observation.profit or 0.0)
                     final_cash = float(result.observation.cash or 0.0)
                     tr = result.observation.tool_result or {}
-                    tool_result_text = json.dumps(tr, indent=2)[:400]
                     profit_delta = final_profit - prev_profit
                     prev_profit = final_profit
 
+                    ok = tr.get("success", True)
+
+                    # Build a clear, instructive tool response for the model
+                    if not ok:
+                        err = tr.get("error", "unknown error")
+                        # Enrich type-mismatch errors so model knows exactly what to fix
+                        if "type mismatch" in err.lower() or "insufficient skill" in err.lower():
+                            c_type   = tr.get("candidate_type", "?")
+                            r_type   = tr.get("role_type", "?")
+                            c_skill  = tr.get("candidate_skill", "?")
+                            r_skill  = tr.get("role_min_skill", "?")
+                            tool_result_text = (
+                                f"FAILED: {err}\n"
+                                f"  Your candidate is type='{c_type}', skill={c_skill}\n"
+                                f"  The role requires type='{r_type}', min_skill={r_skill}\n"
+                                f"  FIX: Only match a '{r_type}' candidate to this role, "
+                                f"or find a role that needs '{c_type}'.\n"
+                                f"  Check the ACTION GUIDE in the next user message for valid matches."
+                            )
+                        else:
+                            tool_result_text = f"FAILED: {err}\nCheck IDs and try again using the ACTION GUIDE."
+                    else:
+                        tool_result_text = json.dumps(tr, indent=2)[:400]
+
                     status = "+" if profit_delta > 0 else ("-" if profit_delta < 0 else "=")
+                    result_hint = ""
+                    if not ok:
+                        result_hint = f"  !! FAIL: {tr.get('error', '')[:80]}"
+                    elif tool_name == "match_candidate_to_project":
+                        result_hint = f"  (score={tr.get('match_score','?')} sealed={tr.get('project_sealed','?')})"
                     print(
                         f"  W{week:02d}T{turn:02d} {tool_name:25s} "
                         f"{status} cash=${final_cash:>8,.0f}  ΔP={profit_delta:>+8,.0f}  rew={reward:>+8.2f}"
+                        f"{result_hint}"
                     )
 
                     if tool_name == "advance_week":
@@ -291,23 +328,78 @@ def rollout_full_episode(
         system_msg = conversation[0]
         recent = conversation[-6:] if len(conversation) > 7 else conversation[1:]
 
-        week_state: dict = {}
+        cand_state: dict = {}
+        client_state: dict = {}
         try:
             r = env.step(StaffingAction(tool="get_candidate_state", params={}))
-            week_state["candidates"] = r.observation.tool_result or {}
+            cand_state = r.observation.tool_result or {}
         except Exception:
             pass
         try:
             r = env.step(StaffingAction(tool="get_client_state", params={}))
-            week_state["clients"] = r.observation.tool_result or {}
+            client_state = r.observation.tool_result or {}
         except Exception:
             pass
 
-        state_str = json.dumps(week_state, indent=2)[:1000]
+        # Build a compact, ID-explicit action guide for the model.
+        # This prevents ID hallucination by giving exact strings to copy-paste.
+        hired = [c for c in cand_state.get("candidates_pool", [])
+                 if c.get("status") in ("hired", "in_pipeline")]
+        open_roles = []
+        for cl in client_state.get("clients", []):
+            for proj in cl.get("projects", []):
+                if proj.get("fill_status") == "SEALED":
+                    continue
+                for role in proj.get("roles", []):
+                    if not role.get("is_filled", False):
+                        open_roles.append({
+                            "project_id": proj["project_id"],
+                            "role_id":    role["role_id"],
+                            "type":       role.get("developer_type", "?"),
+                            "seniority":  role.get("seniority", "?"),
+                            "min_skill":  role.get("min_skill_score", 0),
+                        })
+
+        # Build explicit type→role mapping so the model can match correctly
+        valid_matches = []
+        for c in hired:
+            c_type = c.get("developer_type", "")
+            c_skill = c.get("skill_score", 0.0)
+            for role in open_roles:
+                if role["type"] == c_type and c_skill >= role["min_skill"]:
+                    valid_matches.append({
+                        "candidate_id": c["id"],
+                        "project_id":   role["project_id"],
+                        "role_id":      role["role_id"],
+                        "type":         c_type,
+                    })
+
+        action_guide = (
+            f"\n\nACTION GUIDE — use EXACT IDs below, types must match:\n"
+            f"Your hired candidates (id | type | seniority | skill):\n"
+            + "\n".join(
+                f"  {c['id']:6s} | {c.get('developer_type','?'):12s} | {c.get('seniority_level','?'):6s} | skill={c.get('skill_score',0):.2f}"
+                for c in hired[:8]
+            )
+            + f"\n\nOpen roles needing candidates:\n"
+            + "\n".join(
+                f"  project_id={r['project_id']}  role_id={r['role_id']}  needs={r['type']}  min_skill={r['min_skill']:.2f}"
+                for r in open_roles[:8]
+            )
+            + (f"\n\nVALID MATCHES (copy these calls directly):\n"
+               + "\n".join(
+                   f"  match_candidate_to_project(candidate_id=\"{m['candidate_id']}\", project_id=\"{m['project_id']}\", role_id=\"{m['role_id']}\")"
+                   for m in valid_matches[:6]
+               ) if valid_matches else "\n\n(No valid type matches yet — hire candidates matching open role types)")
+            + "\n\nAlways call confirm_project(project_id=...) before matching if not yet confirmed."
+        )
+
+        state_str = json.dumps({"candidates": cand_state, "clients": client_state}, indent=2)[:800]
         conversation = [system_msg] + recent + [{
             "role": "user",
             "content": (
-                f"[Week {week + 1} of 52 — current state]\n{state_str}\n\n"
+                f"[Week {week + 1} of 52 — current state]\n{state_str}"
+                f"{action_guide}\n\n"
                 "Continue: hire candidates, fill project roles, then call advance_week."
             ),
         }]

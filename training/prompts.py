@@ -15,42 +15,69 @@ import re
 # System prompt
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a staffing agency CEO managing a recruiting business.
-Your goal is to maximise profit over 52 business weeks by:
-1. Finding and interviewing candidates from the market
-2. Hiring top candidates and placing them on client projects
-3. Managing client relationships and filling projects before deadlines
-4. Balancing bench costs (hired-but-unplaced = salary drain) vs revenue
+SYSTEM_PROMPT = """You are a staffing agency CEO. Maximize profit over 52 weeks by hiring candidates and placing them on client projects.
 
-MULTI-TURN BUSINESS WEEKS:
-- You can take MULTIPLE actions in a single week (interviewing, hiring, matching).
-- Time ONLY advances when you call `advance_week`.
-- You SHOULD take all necessary actions for the current week and THEN call `advance_week`.
-- Do not call `advance_week` until you have finished your business for that week.
-- You are limited to 10 actions per week. If you exceed this, the week will advance automatically.
+══════════════════════════════════════════
+EXACT WORKFLOW EACH WEEK (follow in order)
+══════════════════════════════════════════
+STEP 1 — Discover open projects and what types they need:
+  find_available_projects()
+  → returns list of projects with project_id, role_id, developer_type, min_skill_score, bill_rate_weekly
+  → ALWAYS call this first so you know what types of candidates to hire
 
-CRITICAL ECONOMICS (updated):
-- Interview costs $500 per candidate screened - be selective
-- Salary is DYNAMIC: every candidate has a unique salary_expectation (their floor)
-  -> Junior backend ~$75k/yr, Senior ML Engineer ~$150k × 1.3 × skill modifier
-- Bill rate is VARIABLE per role: what the client pays (set by project, $130k–$300k+/yr)
-- TRUE MARGIN = bill_rate_weekly − salary_weekly per placed candidate per week
-  -> A cheap junior (salary $1,200/wk) on a $3,000/wk bill-rate role = +$1,800/wk profit
-  -> An expensive senior ($3,000/wk) on a $2,800/wk role = −$200/wk LOSS every week
-- Benched candidate = −salary_weekly BURN per week (dynamic, not fixed)
-- Onboarding: −$2,000 one-time per hire
-- Projects must be FULLY filled (SEALED) to lock in recurring revenue
-- Expired projects = large penalty; client churn (satisfaction < 0.3) = $50,000 LTV loss
+STEP 2 — Hire candidates that match open role types:
+  find_candidate(developer_type="backend")    ← use type from find_available_projects
+  interview_candidate(candidate_id="C3")      ← costs $500
+  negotiate_salary(candidate_id="C3", offer_weekly=1200)
+  hire_candidate(candidate_id="C3")           ← costs $2,000
 
-STRATEGY HINTS:
-- Use negotiate_salary to lower a candidate's salary before hiring them
-- Check bill_rate_weekly on each role before committing a candidate - only place where margin > 0
-- Use get_market_demand to identify which developer types are most needed
-- Check get_client_state to see open projects and their deadlines before committing candidates
-- Pass on projects where you cannot fill all roles — preventing expiry avoids the penalty
-- Let go of benched candidates whose salary exceeds any available bill rate (they lose money)
+STEP 3 — Place the candidate (types MUST match):
+  confirm_project(project_id="P2")            ← commit to the project first
+  match_candidate_to_project(candidate_id="C3", project_id="P2", role_id="R2-0")
+  ← candidate type must equal role developer_type exactly
 
-Use the available tools to manage your agency. Think step by step.
+STEP 4 — End the week:
+  advance_week()                              ← billing fires, bench costs fire
+
+══════════════════════════════════════════
+CRITICAL MATCHING RULE — READ THIS CAREFULLY
+══════════════════════════════════════════
+match_candidate_to_project WILL FAIL if:
+  ✗ candidate.developer_type ≠ role.developer_type  (e.g. "backend" candidate → "frontend" role)
+  ✗ candidate.skill_score < role.min_skill_score
+  ✗ candidate is not hired yet
+  ✗ project_id or role_id is wrong / not confirmed
+
+To match successfully:
+  ✓ Find the candidate's developer_type (shown in find_candidate results)
+  ✓ Find a role with the SAME developer_type (shown in the ACTION GUIDE each week)
+  ✓ Use the EXACT IDs from the ACTION GUIDE — never invent IDs
+  ✓ Confirm the project first with confirm_project(project_id=...)
+
+══════════════════════════════════════════
+ECONOMICS
+══════════════════════════════════════════
+REVENUE per week   = bill_rate_weekly per placed candidate (from project role)
+COST per week      = salary_weekly per hired candidate (placed or benched)
+PROFIT per week    = revenue − costs
+- Interview:  −$500 one-time
+- Hire:       −$2,000 one-time onboarding
+- Bench burn: −salary_weekly if hired but NOT placed on a project
+- Margin:     bill_rate_weekly − salary_weekly (must be POSITIVE to make money)
+- Expired project:  large penalty
+- Client churn (satisfaction < 0.3): −$50,000
+
+KEY: A backend candidate with salary $1,200/wk on a backend role billing $3,000/wk = +$1,800/wk profit.
+     An unplaced candidate at $1,200/wk = −$1,200/wk loss every week.
+
+══════════════════════════════════════════
+RULES
+══════════════════════════════════════════
+- Max 10 actions per week. Call advance_week when done.
+- Each week you receive an ACTION GUIDE with real IDs and VALID MATCHES — use them.
+- DO NOT invent IDs. Use only IDs from tool responses or the ACTION GUIDE.
+- negotiate_salary BEFORE hire to maximize margin.
+- let_go_candidate for benched candidates you cannot place.
 """
 
 
@@ -73,10 +100,17 @@ TOOLS: list[dict] = [
         "description": "Get lists of hired, interviewing, and available candidates.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
+        "name": "get_candidate_types",
+        "description": "Returns valid developer_type and seniority_level enum values plus skill/composite score ranges. Call this before find_candidate if unsure of valid filter values.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
         "name": "find_candidate",
-        "description": "Search the market for a new candidate by developer type.",
+        "description": "Search the market for candidates. Call get_candidate_types first to see valid filter values. All filters are optional and combinable.",
         "parameters": {"type": "object", "properties": {
-            "developer_type": {"type": "string", "description": "Optional type e.g. 'Backend', 'Frontend', 'ML Engineer'"}}}}},
+            "developer_type":      {"type": "string",  "description": "e.g. 'backend', 'frontend', 'ml engineer'"},
+            "seniority_level":     {"type": "string",  "description": "e.g. 'junior', 'mid', 'senior'"},
+            "min_skill_score":     {"type": "number",  "description": "Minimum skill score (0.0–1.0); requires a prior interview"},
+            "min_composite_rating":{"type": "number",  "description": "Minimum composite rating (0.0–1.0); requires a prior interview"}}}}},
     {"type": "function", "function": {
         "name": "interview_candidate",
         "description": "Perform a technical interview with a candidate to reveal skills and salary. Costs $500.",
@@ -111,8 +145,27 @@ TOOLS: list[dict] = [
         "description": "See which roles are currently most requested by clients.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
+        "name": "find_available_projects",
+        "description": "List all open (non-sealed) projects with their roles, required developer_type, min_skill_score, and bill_rate_weekly. Call this to discover project_id and role_id values before confirming or matching.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
         "name": "confirm_project",
-        "description": "Commit to taking on a project from a client.",
+        "description": "Commit to a project so you can fill its roles. Call find_available_projects first to get valid project_id values.",
+        "parameters": {"type": "object", "properties": {
+            "project_id": {"type": "string"}}, "required": ["project_id"]}}},
+    {"type": "function", "function": {
+        "name": "pass_on_project",
+        "description": "Decline a project you cannot fill, avoiding an expiry penalty.",
+        "parameters": {"type": "object", "properties": {
+            "project_id": {"type": "string"}}, "required": ["project_id"]}}},
+    {"type": "function", "function": {
+        "name": "let_go_candidate",
+        "description": "Release a benched candidate who is costing more salary than any available bill rate. Costs 2× weekly salary as severance.",
+        "parameters": {"type": "object", "properties": {
+            "candidate_id": {"type": "string"}}, "required": ["candidate_id"]}}},
+    {"type": "function", "function": {
+        "name": "request_project_extension",
+        "description": "Request more time on a project approaching its deadline.",
         "parameters": {"type": "object", "properties": {
             "project_id": {"type": "string"}}, "required": ["project_id"]}}},
     {"type": "function", "function": {
