@@ -1,9 +1,3 @@
-## Contributors
-
-- [shubham2345](https://github.com/shubham2345)
-- [kitrakrev](https://github.com/kitrakrev)
-
-
 ---
 title: My Env Environment Server
 emoji: 🚀
@@ -21,9 +15,20 @@ tags:
 
 A simple test environment that echoes back messages. Perfect for testing the env APIs as well as demonstrating environment usage patterns.
 
+## Live Deployment
+
+You can access the current deployment here:  
+https://huggingface.co/spaces/openenv-community/staffing-agency
+
 ## Quick Start
 
-The simplest way to use the My Env environment is through the `MyEnv` class:
+The simplest way to use the **MyEnv** environment is through the `MyEnv` class.
+
+## Contributors
+
+- [shubham2345](https://github.com/shubham2345)
+- [kitrakrev](https://github.com/kitrakrev)
+---
 
 ```python
 from my_env import MyAction, MyEnv
