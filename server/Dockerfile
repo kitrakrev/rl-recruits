@@ -1,14 +1,11 @@
-# Stage 1: Build
 ARG BASE_IMAGE=ghcr.io/meta-pytorch/openenv-base:latest
-FROM ${BASE_IMAGE} AS builder
+FROM ${BASE_IMAGE}
+
 WORKDIR /app/env
 COPY . .
-RUN uv sync --frozen --no-editable
 
-# Stage 2: Runtime
-FROM ${BASE_IMAGE}
-WORKDIR /app/env
-COPY --from=builder /app/env /app/env
+# Install project deps into the system Python (so uvicorn can find them)
+RUN uv pip install --system -e .
 
 ENV LLM_MODE=stub
 ENV ANTHROPIC_API_KEY=""
