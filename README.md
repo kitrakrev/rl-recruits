@@ -1,3 +1,13 @@
+---
+title: Staffing Agency
+emoji: 🏢
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Staffing Agency — OpenEnv RL Environment
 
 > **Hackathon Theme:** Multi-Agent Interactions + Long-Horizon Planning (Scale AI / Mercor sub-theme)
