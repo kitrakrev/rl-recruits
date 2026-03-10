@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import time
 from collections import deque, defaultdict
 from pathlib import Path
@@ -31,6 +32,12 @@ try:
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False
+
+try:
+    from websockets.sync.client import connect as _ws_connect
+    HAS_WEBSOCKETS = True
+except ImportError:
+    HAS_WEBSOCKETS = False
 
 try:
     import plotly.graph_objects as go
@@ -67,54 +74,103 @@ _episode_stats: list[dict] = []   # summary per episode
 _candidate_lifecycle: deque = deque(maxlen=200)  # events: hired, placed, left
 
 _server_url = "http://localhost:8000"
+_ws_url = "ws://localhost:8000/ws"
 _poll_interval = 2.0
+
+# ── WebSocket session (stateful — persists env state across calls) ────────────
+_ws_conn = None          # active websockets.sync.client.ClientConnection
+_ws_lock = threading.Lock()
 _last_full_state: dict = {}
 _log_lines: deque = deque(maxlen=100)
 _current_episode = 0
 _episode_start_cash = 50_000.0
 
+# ── Demo Agent state ──────────────────────────────────────────────────────────
+_demo_running: bool = False
+_demo_thread: threading.Thread | None = None
+_demo_status: str = "Idle"
+_demo_lock = threading.Lock()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Server communication helpers
+# Server communication helpers  (WebSocket — stateful persistent session)
 # ─────────────────────────────────────────────────────────────────────────────
+# The HTTP /step and /reset endpoints are STATELESS — each request creates a
+# new environment instance that is destroyed immediately after. Only the
+# WebSocket /ws endpoint keeps a persistent env session where state accumulates.
+# We therefore use WebSocket for all env interactions.
 
-def _post(endpoint: str, payload: dict) -> dict:
-    if not HAS_REQUESTS:
-        return {"error": "requests not installed"}
-    try:
-        r = requests.post(f"{_server_url}{endpoint}", json=payload, timeout=5)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _get(endpoint: str) -> dict:
-    if not HAS_REQUESTS:
-        return {"error": "requests not installed"}
-    try:
-        r = requests.get(f"{_server_url}{endpoint}", timeout=5)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
+def _ws_rpc(message: dict) -> dict:
+    """Send one WS message and return the response data dict.
+    Caller MUST hold _ws_lock.
+    Reconnects once automatically if the connection is stale.
+    """
+    global _ws_conn
+    for attempt in range(2):
+        if _ws_conn is None:
+            if not HAS_WEBSOCKETS:
+                raise RuntimeError("websockets package not available")
+            _ws_conn = _ws_connect(_ws_url, open_timeout=10)
+        try:
+            _ws_conn.send(json.dumps(message))
+            raw = _ws_conn.recv(timeout=30)
+            resp = json.loads(raw)
+            # WS responses: {"type": "observation"|"state"|"error", "data": {...}}
+            return resp.get("data", resp)
+        except Exception:
+            try:
+                _ws_conn.close()
+            except Exception:
+                pass
+            _ws_conn = None
+            if attempt == 1:
+                raise
 
 
 def call_tool(tool_name: str, params: dict | None = None) -> dict:
-    payload = {"tool": tool_name, "params": params or {}}
-    return _post("/step", payload)
+    """Call an env tool via the persistent WebSocket session."""
+    action = {
+        "type": "call_tool",
+        "tool_name": tool_name,
+        "arguments": params or {},
+    }
+    with _ws_lock:
+        try:
+            # WS step message: {"type": "step", "data": <action_dict>}
+            return _ws_rpc({"type": "step", "data": action})
+        except Exception as e:
+            return {"error": str(e)}
 
 
 def reset_env(seed: int | None = None) -> dict:
-    payload = {"seed": seed} if seed is not None else {}
-    return _post("/reset", payload)
+    """Reset env by closing the WS connection (destroys server session) and
+    opening a fresh one, then sending reset.  State is wiped on the server."""
+    global _ws_conn
+    with _ws_lock:
+        # Close existing connection → server destroys the old env session
+        if _ws_conn is not None:
+            try:
+                _ws_conn.close()
+            except Exception:
+                pass
+            _ws_conn = None
+        time.sleep(0.3)   # brief pause so server can clean up the session slot
+        data: dict = {}
+        if seed is not None:
+            data["seed"] = seed
+        try:
+            return _ws_rpc({"type": "reset", "data": data})
+        except Exception as e:
+            return {"error": str(e)}
 
 
 def health_check() -> bool:
+    """Ping the HTTP /health endpoint (doesn't need state)."""
     try:
         if not HAS_REQUESTS:
             return False
-        r = requests.get(f"{_server_url}/health", timeout=2)
+        http_url = _server_url.rstrip("/") + "/health"
+        r = requests.get(http_url, timeout=2)
         return r.status_code == 200
     except Exception:
         return False
@@ -787,6 +843,204 @@ def do_reset(seed_str: str) -> tuple[str, str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Heuristic Demo Agent
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _demo_agent_step(action_delay: float = 1.2) -> None:
+    """Run one full heuristic episode. Called in a background thread."""
+    global _demo_status, _current_episode, _episode_start_cash
+
+    def _set(msg: str):
+        global _demo_status
+        _demo_status = msg
+        _log(f"[Agent] {msg}")
+
+    def _unwrap_tool(r: dict) -> dict:
+        """Extract tool_result from step response."""
+        obs = r.get("observation", {})
+        wrap = obs.get("result", {}) if isinstance(obs, dict) else {}
+        return wrap.get("tool_result", wrap) if isinstance(wrap, dict) else {}
+
+    def _step(tool: str, args: dict | None = None) -> dict:
+        """Call a tool and record it in agent analytics."""
+        result = call_tool(tool, args or {})
+        tr = _unwrap_tool(result)
+        reward = result.get("reward", 0.0)
+        obs = result.get("observation", {})
+        ctx = obs.get("result", {}).get("_ctx", {}) if isinstance(obs, dict) else {}
+        step_n = ctx.get("step", 0)
+        success = not (isinstance(tr, dict) and ("error" in tr or tr.get("success") is False))
+        snippet = str(tr)[:80] if tr else ""
+        _agent_actions.append((step_n, tool, success, reward, snippet))
+        _tool_counts[tool] += 1
+        _tool_rewards[tool].append(reward)
+        time.sleep(action_delay)
+        return tr
+
+    # ── Reset ──────────────────────────────────────────────────────────────
+    _set("Resetting environment…")
+    reset_env(seed=None)
+    _current_episode += 1
+    for q in _history.values():
+        q.clear()
+    _agent_actions.clear()
+    _tool_counts.clear()
+    _tool_rewards.clear()
+    _episode_start_cash = 50_000.0
+    time.sleep(1.5)
+
+    # ── Confirm projects ───────────────────────────────────────────────────
+    _set("Scanning open projects…")
+    projects_r = _step("find_available_projects")
+    projects = projects_r.get("projects", [])
+    confirmed = []
+    for p in projects[:3]:  # confirm up to 3 projects
+        pid = p.get("project_id") or p.get("id", "")
+        if not pid:
+            continue
+        r = _step("confirm_project", {"project_id": pid})
+        if r.get("success"):
+            confirmed.append(p)
+            _set(f"Confirmed project {pid}")
+
+    # ── Build candidate pipeline ────────────────────────────────────────────
+    # Gather open role types from confirmed projects
+    role_types: list[str] = []
+    for p in confirmed:
+        for role in p.get("roles", []):
+            if not role.get("filled"):
+                role_types.append(role.get("developer_type", "backend"))
+    if not role_types:
+        role_types = ["backend", "frontend", "fullstack"]
+
+    hired_map: dict[str, dict] = {}  # candidate_id → {type, role slots...}
+
+    for dev_type in set(role_types):
+        _set(f"Searching {dev_type} candidates…")
+        cands_r = _step("find_candidate", {"developer_type": dev_type})
+        candidates = cands_r.get("candidates", [])[:3]  # top 3 per type
+
+        for c in candidates:
+            cid = c.get("candidate_id") or c.get("id", "")
+            if not cid or cid in hired_map:
+                continue
+
+            # Interview
+            _set(f"Interviewing {cid}…")
+            iv = _step("interview_candidate", {"candidate_id": cid})
+            if not iv.get("success", True):
+                continue
+            if iv.get("base_rating", 3) < 2:
+                continue  # skip weak candidates
+
+            # Hire
+            _set(f"Hiring {cid}…")
+            hr = _step("hire_candidate", {"candidate_id": cid})
+            if hr.get("success", False) or "already hired" in str(hr).lower():
+                hired_map[cid] = {"developer_type": dev_type}
+
+    # ── Match candidates to project roles ──────────────────────────────────
+    for p in confirmed:
+        pid = p.get("project_id") or p.get("id", "")
+        for role in p.get("roles", []):
+            if role.get("filled"):
+                continue
+            rid = role.get("role_id") or role.get("id", "")
+            rtype = role.get("developer_type", "backend")
+
+            # Find a hired candidate of matching type
+            for cid, cinfo in list(hired_map.items()):
+                if cinfo.get("developer_type") == rtype and not cinfo.get("placed"):
+                    _set(f"Placing {cid} → {pid} / {rid}")
+                    mr = _step("match_candidate_to_project", {
+                        "candidate_id": cid,
+                        "project_id": pid,
+                        "role_id": rid,
+                    })
+                    if mr.get("success", False):
+                        hired_map[cid]["placed"] = True
+                        break
+
+    # ── Advance weeks until episode ends ───────────────────────────────────
+    max_weeks = 52
+    for week in range(1, max_weeks + 1):
+        if not _demo_running:
+            _set("Stopped by user.")
+            return
+
+        _set(f"Advancing to week {week}…")
+        aw = _step("advance_week")
+
+        # Mid-episode: top-up pipeline if candidates ran out
+        if week % 6 == 0:
+            _set("Mid-episode pipeline refresh…")
+            for dev_type in ["backend", "frontend"]:
+                cands_r = _step("find_candidate", {"developer_type": dev_type})
+                new_cands = [c for c in cands_r.get("candidates", [])
+                             if (c.get("candidate_id") or c.get("id", "")) not in hired_map]
+                for c in new_cands[:2]:
+                    cid = c.get("candidate_id") or c.get("id", "")
+                    if not cid:
+                        continue
+                    iv = _step("interview_candidate", {"candidate_id": cid})
+                    if iv.get("base_rating", 0) >= 3:
+                        hr = _step("hire_candidate", {"candidate_id": cid})
+                        if hr.get("success", False):
+                            hired_map[cid] = {"developer_type": dev_type}
+
+        # Check if episode is done
+        state_r = _step("get_agency_state")
+        cash = state_r.get("cash_balance", 50000)
+        if cash < 0:
+            _set(f"Bankrupt at week {week}! Episode over.")
+            return
+        if aw.get("done") or week >= max_weeks:
+            _set(f"Episode complete after {week} weeks.")
+            return
+
+    _set("Episode finished.")
+
+
+def _demo_loop(action_delay: float) -> None:
+    global _demo_running
+    while _demo_running:
+        try:
+            _demo_agent_step(action_delay)
+        except Exception as e:
+            _log(f"[Agent] Error: {e}")
+            time.sleep(3)
+        if _demo_running:
+            time.sleep(2)  # brief pause between episodes
+
+
+def start_demo_agent(delay_str: str = "1.2") -> str:
+    global _demo_running, _demo_thread
+    with _demo_lock:
+        if _demo_running:
+            return "⚠️ Demo agent already running."
+        try:
+            delay = float(delay_str)
+        except ValueError:
+            delay = 1.2
+        _demo_running = True
+        _demo_thread = threading.Thread(target=_demo_loop, args=(delay,), daemon=True)
+        _demo_thread.start()
+    return "✅ Demo agent started — watch the Live Charts tab!"
+
+
+def stop_demo_agent() -> str:
+    global _demo_running
+    with _demo_lock:
+        _demo_running = False
+    return "🛑 Demo agent stopping… (finishes current action)"
+
+
+def get_demo_status() -> str:
+    state = "🟢 Running" if _demo_running else "⚫ Stopped"
+    return f"{state} — {_demo_status}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Gradio app
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -928,7 +1182,32 @@ Actions called here are tracked in Agent Analytics.
                         sat_btn    = gr.Button("😊 Override Satisfaction")
                         sat_msg    = gr.Textbox(label="Result", interactive=False)
 
-            # ── Tab 6: Episode Control ─────────────────────────────────────
+            # ── Tab 6: Demo Agent ──────────────────────────────────────────
+            with gr.TabItem("🤖 Demo Agent"):
+                gr.Markdown("""
+### Heuristic Demo Agent
+Runs a rule-based agent that automatically plays full episodes:
+confirms projects → hires candidates → places them → advances 52 weeks → repeats.
+
+Watch the **📊 Live Charts** tab to see live activity.
+""")
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        agent_delay = gr.Textbox(value="1.2", label="Action delay (seconds)", max_lines=1)
+                        start_btn = gr.Button("▶ Start Agent", variant="primary")
+                        stop_btn  = gr.Button("⏹ Stop Agent",  variant="stop")
+                    with gr.Column(scale=2):
+                        agent_status = gr.Textbox(
+                            label="Agent Status", interactive=False,
+                            value="⚫ Stopped — Idle",
+                        )
+                        status_timer = gr.Timer(value=2.0)
+
+                start_btn.click(fn=start_demo_agent, inputs=[agent_delay], outputs=[agent_status])
+                stop_btn.click(fn=stop_demo_agent, outputs=[agent_status])
+                status_timer.tick(fn=get_demo_status, outputs=[agent_status])
+
+            # ── Tab 7: Episode Control ─────────────────────────────────────
             with gr.TabItem("⚙ Episode Control"):
                 gr.Markdown("### Reset the episode")
                 with gr.Row():
@@ -998,6 +1277,13 @@ if __name__ == "__main__":
 
     _server_url    = args.server_url
     _poll_interval = args.poll
+    # Derive WebSocket URL from the HTTP server URL
+    _ws_url = (
+        args.server_url
+        .replace("http://", "ws://")
+        .replace("https://", "wss://")
+        .rstrip("/") + "/ws"
+    )
 
     if args.start_server:
         print("Starting env server on :8000 …")
@@ -1008,6 +1294,10 @@ if __name__ == "__main__":
         )
         time.sleep(3)
         print("Env server started.")
+
+    # Auto-start the heuristic demo agent so the Space is always live
+    print("Auto-starting demo agent…")
+    start_demo_agent("1.5")
 
     print(f"\n🏢 Staffing Agency Dashboard → http://{args.host}:{args.port}")
     print(f"   Connecting to env server: {_server_url}\n")

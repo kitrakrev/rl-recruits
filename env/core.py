@@ -73,8 +73,13 @@ class StaffingCore:
         ]
 
         replenish_market(self.market, self.config, self.rng)
-        # Force initial projects to exist at step 0 so agent has work
-        tick_project_arrivals(self.clients, self.config, self.rng)
+        # Force initial projects to exist at step 0 so agent has work.
+        # Poisson arrivals can produce 0 projects (~60% of the time with λ=0.5),
+        # so keep trying until every client has at least one project.
+        for _attempt in range(20):
+            tick_project_arrivals(self.clients, self.config, self.rng)
+            if all(cl.projects for cl in self.clients):
+                break
 
     def world_tick(self) -> float:
         """Run step logic: billing, bench costs, project arrivals, deadlines."""
