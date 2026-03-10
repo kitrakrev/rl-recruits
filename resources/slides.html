@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Staffing Agency RL Agent — Slides</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; background: #1a1a2e; color: #eee; }
+  .slide { max-width: 960px; margin: 40px auto; padding: 48px; background: #16213e; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.4); page-break-after: always; }
+  h1 { color: #e94560; font-size: 2em; border-bottom: 2px solid #e94560; padding-bottom: 8px; }
+  h2 { color: #0f3460; background: #e94560; padding: 8px 16px; border-radius: 6px; color: white; }
+  h3 { color: #53d8fb; }
+  table { width: 100%%; border-collapse: collapse; margin: 16px 0; }
+  th { background: #0f3460; color: white; padding: 8px 12px; text-align: left; }
+  td { padding: 8px 12px; border-bottom: 1px solid #333; }
+  tr:nth-child(even) td { background: rgba(255,255,255,0.05); }
+  pre { background: #0d1117; padding: 16px; border-radius: 8px; overflow-x: auto; }
+  code { font-family: 'Fira Code', monospace; font-size: 0.9em; color: #53d8fb; }
+  p { line-height: 1.6; }
+  li { margin: 4px 0; line-height: 1.5; }
+  @media print { .slide { page-break-after: always; box-shadow: none; } }
+</style>
+</head>
+<body>
+<section class="slide">
+<h1>Staffing Agency RL Agent</h1>
+<h3>Reward Function, Configuration & Model Observations</h3>
+<p>**OpenEnv Hackathon** — Multi-Agent Interactions + Long-Horizon Planning</p>
+</section>
+<section class="slide">
+<h2>Slide 1: Reward Function Design</h2>
+<p>We use a **hybrid reward** combining **immediate (dense)** signals with **delayed & sparse** rewards.</p>
+<h3>Immediate Rewards (per tool call)</h3>
+<table><tr><th>Action</th><th>Reward</th><th>Type</th></tr><tr><td>`interview_candidate`</td><td>−$500</td><td>Dense (cost)</td></tr><tr><td>`hire_candidate`</td><td>−$2,000</td><td>Dense (onboarding)</td></tr><tr><td>`match_candidate_to_project` ✅</td><td>+`max(margin_weekly, 0)`</td><td>Dense (placement bonus)</td></tr><tr><td>`match_candidate_to_project` ❌</td><td>−$100</td><td>Dense (invalid action penalty)</td></tr><tr><td>`negotiate_salary`</td><td>$0</td><td>—</td></tr><tr><td>GET / read-only tools</td><td>$0</td><td>—</td></tr></table>
+</section>
+<section class="slide">
+<h2>Delayed Rewards (on `advance_week`)</h2>
+<p>These are **delayed** — only materialise when the agent advances the simulation clock.</p>
+<table><tr><th>Source</th><th>Reward</th><th>Frequency</th></tr><tr><td>Placed candidate billing</td><td>+`margin_weekly` per placed candidate</td><td>Every week</td></tr><tr><td>Bench burn</td><td>−`salary_weekly` per unplaced hire</td><td>Every week</td></tr><tr><td>Project expiry</td><td>−`unfilled × $1,635 × deadline_remaining`</td><td>When deadline hits 0</td></tr><tr><td>Client churn</td><td>−$50,000 LTV penalty</td><td>satisfaction < 0.3</td></tr><tr><td>Speed bonus (sealed ≤ 2 weeks)</td><td>+`margin × 0.1`</td><td>On fast project seal</td></tr></table>
+</section>
+<section class="slide">
+<h2>Sparse Rewards (end-of-episode)</h2>
+<table><tr><th>Source</th><th>Reward</th><th>Condition</th></tr><tr><td>Win bonus</td><td>+$50,000</td><td>`profit ≥ $200,000`</td></tr><tr><td>Bankruptcy</td><td>Episode terminates</td><td>`cash < 0`</td></tr></table>
+<h3>Reward Composition Summary</h3>
+<pre><code class="">
+R(t) = immediate_tool_reward        ← dense, per action
+     + world_tick_reward             ← delayed, per advance_week
+     + invalid_action_penalty        ← dense, per failed action
+     + win_bonus                     ← sparse, end of episode
+</code></pre>
+</section>
+<section class="slide">
+<h2>Training: Discounted Returns + Advantage</h2>
+<pre><code class="python">
+# REINFORCE with discounted returns
+G = 0
+for t in range(T-1, -1, -1):
+    G = reward[t] + γ * G        # γ = 0.99
+    returns[t] = G
+
+advantages = (returns - mean) / (std + ε)  # z-score normalisation
+loss = -advantage * log_prob + kl_coeff * KL(π || π_ref)
+</code></pre>
+<li>**γ = 0.99** propagates long-horizon sparse rewards back to early actions</li>
+<li>**KL penalty (0.05)** prevents policy from drifting too far from pre-trained model</li>
+<li>**LoRA adapters only** — base model frozen, KL computed by toggling adapters on/off</li>
+</section>
+<section class="slide">
+<h2>Slide 2: Basic Configuration</h2>
+<h3>Environment Configuration</h3>
+<table><tr><th>Parameter</th><th>Value</th><th>Description</th></tr><tr><td>Episode length</td><td>52 weeks</td><td>1 simulated business year</td></tr><tr><td>Seed capital</td><td>$50,000</td><td>Starting cash</td></tr><tr><td>Clients</td><td>3</td><td>Independent demand sources</td></tr><tr><td>Market pool</td><td>20 candidates</td><td>Available for recruitment</td></tr><tr><td>Contract duration</td><td>26 weeks</td><td>Per placement</td></tr><tr><td>Project deadlines</td><td>4–10 weeks</td><td>Random per project</td></tr><tr><td>Max roles/project</td><td>3</td><td>Multi-role staffing</td></tr><tr><td>Developer types</td><td>5</td><td>backend, frontend, fullstack, ml_engineer, devops</td></tr><tr><td>Seniority levels</td><td>3</td><td>junior, mid, senior</td></tr><tr><td>Type adjacency</td><td>Yes</td><td>e.g. fullstack → backend/frontend roles</td></tr></table>
+</section>
+<section class="slide">
+<h3>Training Configuration</h3>
+<table><tr><th>Parameter</th><th>Qwen3-0.6B</th><th>Qwen3-8B</th></tr><tr><td>LoRA rank (r)</td><td>16</td><td>16</td></tr><tr><td>LoRA alpha (α)</td><td>32</td><td>32</td></tr><tr><td>LoRA target</td><td>all-linear</td><td>all-linear</td></tr><tr><td>Learning rate</td><td>5e-6</td><td>5e-6</td></tr><tr><td>Batch size</td><td>4</td><td>4</td></tr><tr><td>Discount (γ)</td><td>0.99</td><td>0.99</td></tr><tr><td>KL coeff</td><td>0.05</td><td>0.05</td></tr><tr><td>Max prompt tokens</td><td>4,096</td><td>4,096</td></tr><tr><td>Max new tokens</td><td>512</td><td>512</td></tr><tr><td>Temperature</td><td>0.7</td><td>0.7</td></tr><tr><td>Gradient checkpointing</td><td>No</td><td>Yes (required for 80GB)</td></tr><tr><td>Per-sample backward</td><td>No</td><td>Yes (VRAM constraint)</td></tr></table>
+</section>
+<section class="slide">
+<h3>Key Economics</h3>
+<table><tr><th>Parameter</th><th>Value</th></tr><tr><td>Interview cost</td><td>$500</td></tr><tr><td>Onboarding cost</td><td>$2,000</td></tr><tr><td>Severance</td><td>2× weekly salary</td></tr><tr><td>Invalid action penalty</td><td>−$100</td></tr><tr><td>Churn threshold</td><td>satisfaction < 0.3</td></tr><tr><td>Client LTV penalty</td><td>$50,000</td></tr><tr><td>Win bonus</td><td>$50,000 (at $200K profit)</td></tr><tr><td>Reward scale</td><td>÷1,000 for gradient stability</td></tr></table>
+</section>
+<section class="slide">
+<h2>Model Observations</h2>
+<h3>Qwen3-0.6B (600M parameters)</h3>
+<table><tr><th>Metric</th><th>Value</th></tr><tr><td>Mean profit</td><td>−$7,803</td></tr><tr><td>Max profit</td><td>+$80,760</td></tr><tr><td>Min profit</td><td>−$113,869</td></tr><tr><td>Positive profit rate</td><td>**50%**</td></tr><tr><td>Mean loss</td><td>0.0586</td></tr></table>
+<p>**Observations:**</p>
+<li>❌ Frequent parse failures — generates incomplete `<tool_call>` tags</li>
+<li>❌ Cannot reason about type adjacency (fullstack → backend) on its own</li>
+<li>❌ Calls `match_candidate_to_project` with wrong IDs or mismatched types</li>
+<li>✅ **With pre-computed state injection**: learned to copy-paste valid tool calls</li>
+<li>✅ Profit range widened (+$80K max) — some episodes find profitable placements</li>
+</section>
+<section class="slide">
+<h3>Qwen3-8B (8B parameters)</h3>
+<table><tr><th>Metric</th><th>Value</th></tr><tr><td>Mean profit (1 episode)</td><td>+$61,329</td></tr><tr><td>Total reward</td><td>+$57,781</td></tr><tr><td>Parse failures</td><td>0 (clean tool calls)</td></tr></table>
+<p>**Observations:**</p>
+<li>✅ Reliably produces valid `<tool_call>` JSON — zero parse failures</li>
+<li>✅ Follows the interview → hire → match pipeline correctly</li>
+<li>✅ Responds to pre-computed match suggestions immediately</li>
+<li>✅ First episode already profitable (+$61K)</li>
+<li>⚠️ Requires gradient checkpointing + per-sample backward on 80GB GPU</li>
+<li>⚠️ Prompt truncation at 2,048 tokens caused garbage (math gibberish) — fixed at 4,096</li>
+<li>⏳ Full training run pending (OOM resolved, prompt issue fixed)</li>
+</section>
+<section class="slide">
+<h3>Model Comparison Summary</h3>
+<table><tr><th>Capability</th><th>Qwen3-0.6B</th><th>Qwen3-8B</th></tr><tr><td>Tool-call syntax</td><td>❌ Frequent failures</td><td>✅ Reliable</td></tr><tr><td>Follow multi-step pipeline</td><td>⚠️ Needs hand-holding</td><td>✅ Follows instructions</td></tr><tr><td>Type/seniority reasoning</td><td>❌ Cannot do</td><td>⚠️ With hints</td></tr><tr><td>Profit generation</td><td>⚠️ 50% positive</td><td>✅ Profitable ep1</td></tr><tr><td>Training speed</td><td>~1s/step</td><td>~8s/step</td></tr><tr><td>VRAM (80GB A100)</td><td>~3 GB</td><td>~79 GB (grad ckpt)</td></tr><tr><td>**Recommended for**</td><td>Pipeline testing</td><td>**RL training**</td></tr></table>
+</section>
+<section class="slide">
+<h3>Why Both Delayed and Sparse Rewards?</h3>
+<pre><code class="">
+Week 1: interview → hire → match     ← immediate: -$500, -$2K, +$1.8K
+Week 2: advance_week                  ← delayed: +$1.8K billing, -$0 bench
+  ...
+Week 26: contract ends                ← delayed: candidate returns to bench
+Week 52: episode ends                 ← sparse: win bonus if profit > $200K
+</code></pre>
+<li>**Dense rewards** (per tool call) teach the agent which actions are good/bad</li>
+<li>**Delayed rewards** (`advance_week`) teach the agent the compounding effect of placements vs bench burn</li>
+<li>**Sparse rewards** (win bonus) incentivise long-horizon planning — γ=0.99 propagates this back</li>
+<li>Without dense rewards: agent gets no signal for 52 weeks → doesn't learn</li>
+<li>Without delayed rewards: agent doesn't learn bench burn → over-hires</li>
+<li>Without sparse rewards: agent doesn't optimise for episode-level profit</li>
+</section>
+<section class="slide">
+<h3>Architecture Diagram</h3>
+<pre><code class="">
+        ┌─────────────┐
+        │  LLM Agent   │  Qwen3-0.6B / 8B + LoRA
+        │  (Policy π)  │
+        └──────┬───────┘
+               │ tool_call JSON
+               ▼
+        ┌──────────────┐     ┌─────────────────┐
+        │  Rollout Loop │────▶│  OpenEnv Server  │
+        │  (rollout.py) │◀────│  (port 8001)     │
+        └──────┬───────┘     └────────┬────────┘
+               │                      │
+               │ per-step rewards     │ world_tick()
+               ▼                      ▼
+        ┌──────────────┐     ┌─────────────────┐
+        │  REINFORCE    │     │  StaffingCore    │
+        │  + KL penalty │     │  17 tools + sim  │
+        │  (reinforce.py│     │  (env/core.py)   │
+        └──────────────┘     └─────────────────┘
+</code></pre>
+<p>**All rewards come from the live environment — no fabricated signals.**</p>
+</section>
+</body>
+</html>
