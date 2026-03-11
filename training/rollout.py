@@ -14,7 +14,10 @@ import re
 import random
 from typing import TYPE_CHECKING, Callable
 
-from training.prompts import SYSTEM_PROMPT, TOOLS, parse_tool_call
+from training.prompts import SYSTEM_PROMPT, TOOLS, KNOWN_TOOLS, parse_tool_call
+
+# Alias for local use — sourced from prompts so always in sync with TOOLS
+_KNOWN_TOOLS: frozenset[str] = KNOWN_TOOLS
 
 if TYPE_CHECKING:
     from training.config import TrainingConfig
@@ -285,23 +288,75 @@ def rollout_full_episode(
     cumulative_env_reward: float = 0.0
     final_profit = 0.0
 
+    # Fetch episode length from the env so week labels are accurate
+    episode_steps = 52  # default
+    try:
+        r = env.step(StaffingAction(tool="get_agency_state", params={}))
+        episode_steps = int((r.observation.tool_result or {}).get("episode_steps", 52))
+    except Exception:
+        pass
+
     # Seed Week 1: give the model real IDs so it can act immediately.
+<<<<<<< HEAD
     state_text = _build_actionable_state(env, 1)
     final_profit = float(
         env.step(StaffingAction(tool="get_financial_summary", params={}))
         .observation.profit or 0.0
     )
+=======
+    init_state: dict = {}
+    try:
+        r = env.step(StaffingAction(tool="get_financial_summary", params={}))
+        init_state["financials"] = r.observation.tool_result or {}
+        final_profit = float(r.observation.profit or 0.0)
+    except Exception:
+        pass
+    try:
+        r = env.step(StaffingAction(tool="get_candidate_state", params={}))
+        init_state["candidates"] = r.observation.tool_result or {}
+    except Exception:
+        pass
+    try:
+        r = env.step(StaffingAction(tool="find_available_projects", params={}))
+        raw = r.observation.tool_result or {}
+        # Compact project list: show only what the model needs to plan hiring
+        init_state["open_projects"] = [
+            {"project_id": p.get("project_id"), "deadline_week": p.get("deadline_week"),
+             "roles": [{"role_id": ro.get("role_id"), "type": ro.get("developer_type"),
+                        "min_skill": ro.get("min_skill_score"), "bill_rate": ro.get("bill_rate_weekly")}
+                       for ro in p.get("roles", []) if not ro.get("is_filled")]}
+            for p in raw.get("projects", [])[:6]
+        ]
+    except Exception:
+        pass
+>>>>>>> origin/main
 
     conversation = [
         {"role": "system", "content": SYSTEM_PROMPT},
+<<<<<<< HEAD
         {"role": "user", "content": state_text},
+=======
+        {"role": "user", "content": (
+            f"Week 1 of {episode_steps}. Current state:\n{init_str}\n\n"
+            "Take business actions. Find candidates, interview them, hire the best ones, "
+            "confirm projects, and match candidates to project roles to generate profit. "
+            "Call advance_week when done."
+        )},
+>>>>>>> origin/main
     ]
 
     print(f"\n      --- Rollout Phase (Seed {seed}) ---")
 
+<<<<<<< HEAD
     prev_profit = final_profit
     episode_done = False
     for week in range(1, 53):
+=======
+    episode_done = False
+    prev_profit  = final_profit
+    # Use a high upper-bound; real termination comes from env `done` flag
+    for week in range(1, 200):
+>>>>>>> origin/main
         if episode_done:
             break
         week_advanced = False
@@ -367,20 +422,85 @@ def rollout_full_episode(
             if parsed:
                 parse_fail_streak = 0
                 tool_name, params = parsed
+
+                # Catch hallucinated tool names before they silently no-op
+                if tool_name not in _KNOWN_TOOLS:
+                    # Find closest real tool name
+                    closest = min(_KNOWN_TOOLS, key=lambda t: abs(len(t) - len(tool_name)))
+                    tool_result_text = (
+                        f"ERROR: '{tool_name}' is not a valid tool name. "
+                        f"Did you mean '{closest}'? "
+                        f"Valid tools: {sorted(_KNOWN_TOOLS)}"
+                    )
+                    status = "="
+                    print(f"  W{week:02d}T{turn:02d} [BAD TOOL: '{tool_name}' → did you mean '{closest}'?]")
+                    # Feed correction back and skip the env.step
+                    parsed_for_conv = parsed
+                    parsed = None  # treat as parse fail so correction goes into conversation
+                    parse_fail_streak = 0
+                    conversation.append({"role": "assistant", "content": completion_text})
+                    conversation.append({"role": "user", "content": tool_result_text})
+                    prompts_out.append(prompt_str)
+                    completions_out.append(completion_text)
+                    step_rewards.append(0.0)
+                    continue
+
                 try:
                     result = env.step(StaffingAction(tool=tool_name, params=params))
                     reward = float(result.reward or 0.0)
                     final_profit = float(result.observation.profit or 0.0)
                     final_cash = float(result.observation.cash or 0.0)
                     tr = result.observation.tool_result or {}
-                    tool_result_text = json.dumps(tr, indent=2)[:400]
                     profit_delta = final_profit - prev_profit
                     prev_profit = final_profit
+                    if getattr(result.observation, "done", False):
+                        episode_done = True
+
+                    ok = tr.get("success", True)
+
+                    # Build a clear, instructive tool response for the model.
+                    # For failures: surface the enriched reason+fix from the server.
+                    # For success: show key fields + any REQUIRED_NEXT_STEP prominently.
+                    if not ok:
+                        err    = tr.get("error", "unknown error")
+                        reason = tr.get("reason", "")
+                        fix    = tr.get("fix", "")
+                        parts  = [f"FAILED: {err}"]
+                        if reason:
+                            parts.append(f"REASON: {reason}")
+                        # Surface any useful context (bench, market IDs, etc.)
+                        for key in ("your_bench", "your_hired_candidates",
+                                    "current_market_ids", "available_in_market",
+                                    "open_projects", "roles_matching_your_candidate"):
+                            if key in tr:
+                                parts.append(f"{key.upper()}: {json.dumps(tr[key])[:200]}")
+                        if fix:
+                            parts.append(f"FIX: {fix}")
+                        if not reason and not fix:
+                            parts.append("Check IDs and try again using the ACTION GUIDE.")
+                        tool_result_text = "\n".join(parts)
+                    else:
+                        # Success — build a compact summary and always surface NEXT_STEP
+                        core_fields = {k: v for k, v in tr.items()
+                                       if k not in ("success",) and not k.startswith("_")}
+                        tool_result_text = json.dumps(core_fields, indent=2)[:500]
+                        # Pull REQUIRED_NEXT_STEP / next_step to the top so model sees it
+                        for ns_key in ("REQUIRED_NEXT_STEP", "next_step", "roles_to_fill"):
+                            if ns_key in tr:
+                                tool_result_text = (
+                                    f"⚠ NEXT: {tr[ns_key]}\n\n" + tool_result_text
+                                )
 
                     status = "+" if profit_delta > 0 else ("-" if profit_delta < 0 else "=")
+                    result_hint = ""
+                    if not ok:
+                        result_hint = f"  !! FAIL: {tr.get('error', '')[:80]}"
+                    elif tool_name == "match_candidate_to_project":
+                        result_hint = f"  (score={tr.get('match_score','?')} sealed={tr.get('project_sealed','?')})"
                     print(
                         f"  W{week:02d}T{turn:02d} {tool_name:25s} "
                         f"{status} cash=${final_cash:>8,.0f}  ΔP={profit_delta:>+8,.0f}  rew={reward:>+8.2f}"
+                        f"{result_hint}"
                     )
 
                     if tool_name == "advance_week":
@@ -437,7 +557,7 @@ def rollout_full_episode(
                     {
                         "role": "user",
                         "content": (
-                            f"[Week {week} of 52] Your previous responses could not be parsed. "
+                            f"[Week {week} of {episode_steps}] Your previous responses could not be parsed. "
                             "You MUST respond with a tool call and NOTHING else. Example:\n"
                             '<tool_call>\n{"name": "find_candidate", "arguments": {"developer_type": "backend"}}\n</tool_call>\n'
                             "Available tools: find_candidate, interview_candidate, hire_candidate, "
@@ -466,27 +586,141 @@ def rollout_full_episode(
             try:
                 result = env.step(StaffingAction(tool="advance_week", params={}))
                 final_profit = float(result.observation.profit or 0.0)
+<<<<<<< HEAD
                 prev_profit = final_profit  # sync so next week's ΔP is clean
                 if result.done:
                     episode_done = True
                 # Reward is intentionally 0 — auto-advance is not a model action.
                 step_rewards.append(0.0)
                 prompts_out.append("")        # placeholder — no model output for auto-advance
+=======
+                auto_reward = float(result.reward or 0.0)
+                step_rewards.append(auto_reward)
+                cumulative_env_reward += auto_reward
+                prompts_out.append("")
+>>>>>>> origin/main
                 completions_out.append("")
+                if getattr(result.observation, "done", False):
+                    episode_done = True
             except Exception:
                 pass
 
         if episode_done:
+<<<<<<< HEAD
+=======
+            print(f"  W{week:02d}   [episode DONE — env signalled termination]")
+>>>>>>> origin/main
             break
 
         # Trim history and inject fresh state for next week
         system_msg = conversation[0]
         recent = conversation[-6:] if len(conversation) > 7 else conversation[1:]
 
+<<<<<<< HEAD
         state_text = _build_actionable_state(env, week + 1)
         conversation = [system_msg] + recent + [{
             "role": "user",
             "content": state_text,
+=======
+        cand_state: dict = {}
+        client_state: dict = {}
+        try:
+            r = env.step(StaffingAction(tool="get_candidate_state", params={}))
+            cand_state = r.observation.tool_result or {}
+        except Exception:
+            pass
+        try:
+            r = env.step(StaffingAction(tool="get_client_state", params={}))
+            client_state = r.observation.tool_result or {}
+        except Exception:
+            pass
+
+        # ── Candidate roster split by status ─────────────────────────────────
+        all_cands = cand_state.get("candidates_pool", [])
+        # MATCHABLE: on bench, ready to be placed on a project
+        bench    = [c for c in all_cands if c.get("status") == "hired"]
+        # ALREADY PLACED: on a project — do NOT try to match or let_go these
+        placed   = [c for c in all_cands if c.get("status") == "placed"]
+        # INTERVIEWING: interviewed but not yet hired — call hire_candidate next
+        pipeline = [c for c in all_cands if c.get("status") == "in_pipeline"]
+
+        # ── Open roles across all non-sealed projects ─────────────────────
+        open_roles = []
+        for cl in client_state.get("clients", []):
+            for proj in cl.get("projects", []):
+                if proj.get("fill_status") == "SEALED":
+                    continue
+                for role in proj.get("roles", []):
+                    if not role.get("is_filled", False):
+                        open_roles.append({
+                            "project_id": proj["project_id"],
+                            "role_id":    role["role_id"],
+                            "type":       role.get("developer_type", "?"),
+                            "min_skill":  role.get("min_skill_score", 0),
+                        })
+
+        # ── Valid bench→role matches (type-compatible) ────────────────────
+        valid_matches = []
+        for c in bench:
+            c_type  = c.get("developer_type", "")
+            c_skill = c.get("skill_score", 0.0)
+            for role in open_roles:
+                if role["type"] == c_type:
+                    valid_matches.append({
+                        "candidate_id": c["id"],
+                        "project_id":   role["project_id"],
+                        "role_id":      role["role_id"],
+                        "type":         c_type,
+                    })
+
+        lines = ["\n\n═══ ACTION GUIDE (use EXACT IDs — do not invent any) ═══"]
+
+        lines.append(f"\nBENCH (status=hired, ready to match) — {len(bench)} candidates:")
+        if bench:
+            for c in bench[:6]:
+                lines.append(f"  {c['id']:6s} | {c.get('developer_type','?'):12s} | {c.get('seniority_level','?'):6s} | skill={c.get('skill_score',0):.2f}")
+        else:
+            lines.append("  (none — hire more candidates)")
+
+        if placed:
+            lines.append(f"\nALREADY PLACED (status=placed, DO NOT match/let_go these): {[c['id'] for c in placed]}")
+
+        if pipeline:
+            lines.append(f"\nINTERVIEWED (status=in_pipeline, call hire_candidate next): {[c['id'] for c in pipeline]}")
+
+        lines.append(f"\nOPEN ROLES needing candidates — {len(open_roles)} roles:")
+        for r in open_roles[:6]:
+            lines.append(f"  project_id={r['project_id']}  role_id={r['role_id']}  needs={r['type']}  min_skill={r['min_skill']:.2f}")
+
+        if valid_matches:
+            lines.append("\nVALID MATCHES — copy these calls exactly:")
+            for m in valid_matches[:4]:
+                lines.append(
+                    f"  confirm_project(project_id=\"{m['project_id']}\")"
+                    f"  →  match_candidate_to_project("
+                    f"candidate_id=\"{m['candidate_id']}\", "
+                    f"project_id=\"{m['project_id']}\", "
+                    f"role_id=\"{m['role_id']}\")"
+                )
+        else:
+            needed = {r["type"] for r in open_roles}
+            bench_types = {c.get("developer_type") for c in bench}
+            lines.append(f"\n(No bench↔role type matches. Roles need: {sorted(needed)}. "
+                         f"Bench has: {sorted(bench_types)}. "
+                         f"Find and hire a candidate of type in {sorted(needed - bench_types)}.)")
+
+        lines.append("\nTOOL NAME REMINDER: hire_candidate (not 'hired_candidate')")
+        action_guide = "\n".join(lines)
+
+        state_str = json.dumps({"candidates": cand_state, "clients": client_state}, indent=2)[:800]
+        conversation = [system_msg] + recent + [{
+            "role": "user",
+            "content": (
+                f"[Week {week + 1} of {episode_steps} — current state]\n{state_str}"
+                f"{action_guide}\n\n"
+                "Continue: hire candidates, fill project roles, then call advance_week."
+            ),
+>>>>>>> origin/main
         }]
 
     print(f"  --- Episode done: profit=${final_profit:,.0f}  total_reward={cumulative_env_reward:+,.2f} ---")

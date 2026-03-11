@@ -9,8 +9,8 @@ from .models import Candidate, Role, Project, Client, AgencyState
 from .simulation import (
     generate_client, replenish_market, tick_project_arrivals,
     tick_project_deadlines, tick_contracts, tick_candidate_patience,
-    compute_match_score, async_tick_project_deadlines,
-    async_tick_candidate_patience
+    compute_match_score, diagnose_match_failure, async_tick_project_deadlines,
+    async_tick_candidate_patience, _reset_counters
 )
 
 if TYPE_CHECKING:
@@ -50,6 +50,7 @@ class StaffingCore:
         self.expired_projects: list = []
 
     def reset(self, seed: int | None = None) -> None:
+        _reset_counters()  # restart C1, P1, CL1 sequences each episode
         self.rng = random.Random(seed)
         self.step_count = 0
         self.cash = self.config.seed_capital
@@ -410,24 +411,60 @@ class StaffingCore:
             cli_score = round(result.new_score, 3)
         return {"success": True, "reward": 0.0, "confirmed": True, "project_id": project_id, "client_satisfaction": cli_score}
 
-    def tool_find_candidate(self, developer_type: str = "") -> dict:
+    def tool_get_candidate_types(self) -> dict:
+        """Return valid enum values and score ranges for use with find_candidate."""
+        return {
+            "success": True, "reward": 0.0,
+            "developer_types": list(self.config.developer_types),
+            "seniority_levels": list(self.config.seniority_levels),
+            "skill_score_range": {"min": 0.0, "max": 1.0,
+                "note": "Only populated after interview_candidate; uninterviewed = 0.0"},
+            "composite_rating_range": {"min": 0.0, "max": 1.0,
+                "note": "Only populated after hire_candidate or match_candidate_to_project"},
+        }
+
+    async def async_tool_get_candidate_types(self) -> dict:
+        return self.tool_get_candidate_types()
+
+    def tool_find_candidate(
+        self,
+        developer_type: str = "",
+        seniority_level: str = "",
+        min_skill_score: float = 0.0,
+        min_composite_rating: float = 0.0,
+    ) -> dict:
+        found = self.market[:]
         if developer_type:
-            found = [c for c in self.market if c.developer_type == developer_type]
-        else:
-            found = self.market[:]
+            dt = developer_type.lower()
+            found = [c for c in found if c.developer_type == dt]
+        if seniority_level:
+            sl = seniority_level.lower()
+            found = [c for c in found if c.seniority_level == sl]
+        if min_skill_score > 0:
+            found = [c for c in found if getattr(c, "skill_score", 0.0) >= min_skill_score]
+        if min_composite_rating > 0:
+            found = [c for c in found if getattr(c, "composite_rating", 0.0) >= min_composite_rating]
         return {
             "success": True, "reward": 0.0,
             "candidates": [c.to_dict() for c in found],
             "count": len(found),
         }
 
-
-    async def async_tool_find_candidate(self, developer_type: str = "") -> dict:
-        return self.tool_find_candidate(developer_type)
+    async def async_tool_find_candidate(
+        self,
+        developer_type: str = "",
+        seniority_level: str = "",
+        min_skill_score: float = 0.0,
+        min_composite_rating: float = 0.0,
+    ) -> dict:
+        return self.tool_find_candidate(
+            developer_type, seniority_level, min_skill_score, min_composite_rating
+        )
     def tool_interview_candidate(self, candidate_id: str) -> dict:
         c = next((m for m in self.market if m.id == candidate_id), None)
         if not c:
-            return {"success": False, "error": f"Candidate {candidate_id} not in market", "reward": 0.0}
+            return {"success": False, "error": f"Candidate {candidate_id} not in market",
+                    "reward": -150.0}
         
         job_desc = f"{c.developer_type} {c.seniority_level}"
         if c.seniority_level != "junior":
@@ -510,9 +547,13 @@ class StaffingCore:
     def tool_hire_candidate(self, candidate_id: str) -> dict:
         c = self.candidates.get(candidate_id)
         if not c:
-            return {"success": False, "error": f"Candidate {candidate_id} not found", "reward": 0.0}
+            # Candidate not in self.candidates means they were never interviewed
+            # (still in market or ID was invented). Negative reward — wrong workflow.
+            return {"success": False, "error": f"Candidate {candidate_id} not found",
+                    "reward": -300.0}
         if c.status not in ("in_pipeline", "pending_hire"):
-            return {"success": False, "error": f"Cannot hire: status is '{c.status}'", "reward": 0.0}
+            return {"success": False, "error": f"Cannot hire: status is '{c.status}'",
+                    "reward": -300.0}
 
         self.cash -= self.config.onboarding_cost
         self.costs += self.config.onboarding_cost
@@ -588,27 +629,30 @@ class StaffingCore:
     def tool_match_candidate_to_project(self, candidate_id: str, project_id: str, role_id: str) -> dict:
         c = self.candidates.get(candidate_id)
         if not c or c.status != "hired":
-            return {"success": False, "error": "Candidate must be in 'hired' status / available", "reward": 0.0}
+            status = c.status if c else "not_in_roster"
+            return {"success": False,
+                    "error": f"Candidate must be in 'hired' status / available (current: {status})",
+                    "reward": -300.0}
 
         project = self.find_project(project_id)
         if not project:
-            return {"success": False, "error": f"Project {project_id} not found", "reward": 0.0}
+            return {"success": False, "error": f"Project {project_id} not found", "reward": -200.0}
 
         role = next((r for r in project.roles if r.role_id == role_id), None)
         if not role:
-            return {"success": False, "error": f"Role {role_id} not found", "reward": 0.0}
+            return {"success": False, "error": f"Role {role_id} not found", "reward": -200.0}
 
         if role.is_filled:
-            return {"success": False, "error": "Role is already fully filled", "reward": 0.0}
+            return {"success": False, "error": "Role is already fully filled", "reward": -100.0}
 
         match_score = compute_match_score(c, role, self.config)
         if match_score == 0.0:
             return {
-                "success": False, 
-                "error": "Illegal assignment \u2014 type mismatch or insufficient skill" if self.env_type=="mcp" else "Illegal assignment \u2014 skill or type mismatch", 
-                "reward": 0.0,
+                "success": False,
+                "error": diagnose_match_failure(c, role, self.config),
+                "reward": -300.0,
                 "candidate_type": c.developer_type, "role_type": role.developer_type,
-                "candidate_skill": c.skill_score, "role_min_skill": role.min_skill_score
+                "candidate_skill": c.skill_score, "role_min_skill": role.min_skill_score,
             }
 
         client = next((cl for cl in self.clients if cl.client_id == project.client_id), None)
@@ -706,10 +750,10 @@ class StaffingCore:
         if match_score == 0.0:
             return {
                 "success": False,
-                "error": "Illegal assignment \u2014 type mismatch or insufficient skill" if self.env_type=="mcp" else "Illegal assignment \u2014 skill or type mismatch",
+                "error": diagnose_match_failure(c, role, self.config),
                 "reward": 0.0,
                 "candidate_type": c.developer_type, "role_type": role.developer_type,
-                "candidate_skill": c.skill_score, "role_min_skill": role.min_skill_score
+                "candidate_skill": c.skill_score, "role_min_skill": role.min_skill_score,
             }
 
         client = next((cl for cl in self.clients if cl.client_id == project.client_id), None)
@@ -784,7 +828,8 @@ class StaffingCore:
     def tool_let_go_candidate(self, candidate_id: str) -> dict:
         c = self.candidates.get(candidate_id)
         if not c:
-            return {"success": False, "error": f"Candidate {candidate_id} not found", "reward": 0.0}
+            return {"success": False, "error": f"Candidate {candidate_id} not found",
+                    "reward": -200.0}
         severance = c.salary_weekly * self.config.severance_weeks
         self.cash -= severance
         self.costs += severance

@@ -1,4 +1,5 @@
 {
+<<<<<<< HEAD
   "random": {
     "mean_reward": -11.851,
     "mean_profit": -15850.96,
@@ -22,5 +23,14 @@
     "min_profit": -2120.19,
     "positive_profit_rate": 0.0,
     "mean_loss": 0.0
+=======
+  "grpo_mc_training": {
+    "mean_reward": 7697.1059,
+    "mean_profit": -4803.95,
+    "max_profit": -3858.51,
+    "min_profit": -5824.92,
+    "positive_profit_rate": 0.0,
+    "mean_loss": -0.1415
+>>>>>>> origin/main
   }
 }
