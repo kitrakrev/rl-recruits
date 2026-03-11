@@ -86,42 +86,24 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """You are a staffing agency CEO managing a recruiting business.
-Your goal is to maximise profit over 52 business weeks by:
-1. Finding and interviewing candidates from the market
-2. Hiring top candidates and placing them on client projects
-3. Managing client relationships and filling projects before deadlines
-4. Balancing bench costs (hired-but-unplaced = salary drain) vs revenue
+SYSTEM_PROMPT = """You are a staffing agency CEO. Maximise profit over 52 weeks.
 
-MULTI-TURN BUSINESS WEEKS:
-- You can take MULTIPLE actions in a single week (interviewing, hiring, matching).
-- Time ONLY advances when you call `advance_week`.
-- You SHOULD take all necessary actions for the current week and THEN call `advance_week`.
-- Do not call `advance_week` until you have finished your business for that week.
-- You are limited to 10 actions per week. If you exceed this, the week will advance automatically.
+EACH WEEK, follow this exact pipeline:
+1. find_available_projects → see open projects (get project_id, role_id, developer_type, bill_rate_weekly)
+2. find_candidate → see market candidates (get candidate id, developer_type, skill_score)
+3. interview_candidate(candidate_id) → screen a candidate matching a needed role type ($500 cost)
+4. hire_candidate(candidate_id) → hire the interviewed candidate ($2000 onboarding)
+5. match_candidate_to_project(candidate_id, project_id, role_id) → place hired candidate on a role
+6. advance_week → end the week (triggers billing: placed candidates earn margin, benched candidates cost salary)
 
-CRITICAL ECONOMICS (updated):
-- Interview costs $500 per candidate screened - be selective
-- Salary is DYNAMIC: every candidate has a unique salary_expectation (their floor)
-  -> Junior backend ~$75k/yr, Senior ML Engineer ~$150k × 1.3 × skill modifier
-- Bill rate is VARIABLE per role: what the client pays (set by project, $130k–$300k+/yr)
-- TRUE MARGIN = bill_rate_weekly − salary_weekly per placed candidate per week
-  -> A cheap junior (salary $1,200/wk) on a $3,000/wk bill-rate role = +$1,800/wk profit
-  -> An expensive senior ($3,000/wk) on a $2,800/wk role = −$200/wk LOSS every week
-- Benched candidate = −salary_weekly BURN per week (dynamic, not fixed)
-- Onboarding: −$2,000 one-time per hire
-- Projects must be FULLY filled (SEALED) to lock in recurring revenue
-- Expired projects = large penalty; client churn (satisfaction < 0.3) = $50,000 LTV loss
-
-STRATEGY HINTS:
-- Use negotiate_salary to lower a candidate's salary before hiring them
-- Check bill_rate_weekly on each role before committing a candidate - only place where margin > 0
-- Use get_market_demand to identify which developer types are most needed
-- Confirm projects before committing candidates (confirm_project)
-- Pass on projects where you cannot fill all roles - preventing expiry avoids the penalty
-- Let go of benched candidates whose salary exceeds any available bill rate (they lose money)
-
-Use the available tools to manage your agency. Think step by step.
+CRITICAL RULES:
+- You MUST call find_available_projects first to get project_id and role_id values
+- You MUST call find_candidate to get candidate IDs before interviewing
+- Only interview candidates whose developer_type matches an open role's developer_type
+- Only match candidates to roles where their developer_type and skill_score fit
+- Margin = bill_rate_weekly - salary_weekly. Only place if margin > 0
+- Benched (hired but unplaced) candidates drain salary_weekly per week
+- Call advance_week when done with all actions for the current week
 """
 TOOLS = [
     {"type": "function", "function": {"name": "get_agency_state", "description": "Get overall agency metrics and current week.", "parameters": {"type": "object", "properties": {}}}},
@@ -945,33 +927,54 @@ def train_grpo(args):
         completions_out: list[str] = []
         final_profit = 0.0
 
-        # Seed Week 1 with full agency state so model has real IDs immediately.
-        init_state: dict = {}
+        # Seed Week 1 with actionable data: projects (with IDs) + candidates (with IDs).
+        # Use find_available_projects + find_candidate — these are NOT passive tools,
+        # so they don't poison the server's passive-streak counter.
+        projects_data = []
+        candidates_data = []
         try:
-            r = env.step(StaffingAction(tool="get_financial_summary", params={}))
-            init_state["financials"] = r.observation.tool_result or {}
+            r = env.step(StaffingAction(tool="find_available_projects", params={}))
+            projects_data = (r.observation.tool_result or {}).get("projects", [])
             final_profit = float(r.observation.profit or 0.0)
         except Exception:
             pass
         try:
-            r = env.step(StaffingAction(tool="get_candidate_state", params={}))
-            init_state["candidates"] = r.observation.tool_result or {}
-        except Exception:
-            pass
-        try:
-            r = env.step(StaffingAction(tool="get_client_state", params={}))
-            init_state["clients"] = r.observation.tool_result or {}
+            r = env.step(StaffingAction(tool="find_candidate", params={}))
+            candidates_data = (r.observation.tool_result or {}).get("candidates", [])
         except Exception:
             pass
 
-        init_str = json.dumps(init_state, indent=2)[:1200]
+        # Format actionable summary: show the model exactly what IDs to use
+        proj_lines = []
+        for p in projects_data[:3]:  # limit to 3 projects
+            for role in p.get("roles", [])[:2]:
+                if not role.get("is_filled"):
+                    proj_lines.append(
+                        f"  - project_id={p['project_id']} role_id={role['role_id']} "
+                        f"needs={role.get('developer_type','?')} "
+                        f"seniority={role.get('seniority','?')} "
+                        f"bill_rate=${role.get('bill_rate_weekly', 0):,.0f}/wk "
+                        f"deadline={p.get('deadline_remaining','?')} weeks"
+                    )
+        cand_lines = []
+        for c in candidates_data[:6]:  # limit to 6 candidates
+            cand_lines.append(
+                f"  - id={c['id']} type={c.get('developer_type','?')} "
+                f"seniority={c.get('seniority_level','?')} "
+                f"skill={c.get('skill_score', 0):.2f}"
+            )
+
+        init_context = "OPEN PROJECTS (need filling):\n"
+        init_context += "\n".join(proj_lines) if proj_lines else "  (none yet)"
+        init_context += "\n\nAVAILABLE CANDIDATES (in market):\n"
+        init_context += "\n".join(cand_lines) if cand_lines else "  (none yet)"
+
         conversation = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": (
-                f"Week 1 of 52. Current state:\n{init_str}\n\n"
-                "Take business actions. Find candidates, interview them, hire the best ones, "
-                "confirm projects, and match candidates to project roles to generate profit. "
-                "Call advance_week when done."
+                f"Week 1 of 52.\n\n{init_context}\n\n"
+                "Start the pipeline: interview a candidate whose type matches an open role, "
+                "then hire them, then match them to that role. Use the exact IDs shown above."
             )},
         ]
 
@@ -1093,24 +1096,50 @@ def train_grpo(args):
             system_msg = conversation[0]
             recent = conversation[-6:] if len(conversation) > 7 else conversation[1:]
 
-            week_state: dict = {}
+            # Refresh actionable data for next week (non-passive tools to avoid penalty poisoning)
+            week_projects = []
+            week_candidates = []
             try:
-                r = env.step(StaffingAction(tool="get_candidate_state", params={}))
-                week_state["candidates"] = r.observation.tool_result or {}
+                r = env.step(StaffingAction(tool="find_available_projects", params={}))
+                week_projects = (r.observation.tool_result or {}).get("projects", [])
+                final_profit = float(r.observation.profit or 0.0)
             except Exception:
                 pass
             try:
-                r = env.step(StaffingAction(tool="get_client_state", params={}))
-                week_state["clients"] = r.observation.tool_result or {}
+                r = env.step(StaffingAction(tool="find_candidate", params={}))
+                week_candidates = (r.observation.tool_result or {}).get("candidates", [])
             except Exception:
                 pass
 
-            state_str = json.dumps(week_state, indent=2)[:1000]
+            # Format actionable summary for next week
+            wp_lines = []
+            for p in week_projects[:3]:
+                for role in p.get("roles", [])[:2]:
+                    if not role.get("is_filled"):
+                        wp_lines.append(
+                            f"  - project_id={p['project_id']} role_id={role['role_id']} "
+                            f"needs={role.get('developer_type','?')} "
+                            f"bill_rate=${role.get('bill_rate_weekly', 0):,.0f}/wk "
+                            f"deadline={p.get('deadline_remaining','?')} weeks"
+                        )
+            wc_lines = []
+            for c in week_candidates[:6]:
+                wc_lines.append(
+                    f"  - id={c['id']} type={c.get('developer_type','?')} "
+                    f"skill={c.get('skill_score', 0):.2f}"
+                )
+
+            week_ctx = "OPEN PROJECTS:\n"
+            week_ctx += "\n".join(wp_lines) if wp_lines else "  (none)"
+            week_ctx += "\nAVAILABLE CANDIDATES:\n"
+            week_ctx += "\n".join(wc_lines) if wc_lines else "  (none)"
+
             conversation = [system_msg] + recent + [{
                 "role": "user",
                 "content": (
-                    f"[Week {week + 1} of 52 — current state]\n{state_str}\n\n"
-                    "Continue: hire candidates, fill project roles, then call advance_week."
+                    f"[Week {week + 1} of 52]\n{week_ctx}\n\n"
+                    "Interview a candidate matching an open role, hire them, match them to the role, "
+                    "then call advance_week."
                 ),
             }]
 

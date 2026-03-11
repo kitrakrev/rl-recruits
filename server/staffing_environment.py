@@ -174,7 +174,12 @@ class StaffingAgencyEnvironment(MCPEnvironment):
     _GET_TOOLS = frozenset({
         "get_agency_state", "get_client_state", "get_candidate_state",
         "get_project_details", "get_candidate_profile",
+<<<<<<< HEAD
+        "get_market_demand", "get_financial_summary",
+        "find_candidate", "find_available_projects",  # read-only lookups
+=======
         "get_market_demand", "get_financial_summary", "get_candidate_types",
+>>>>>>> origin/main
         "_override_cash", "_override_satisfaction",
     })
 
@@ -240,6 +245,21 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         tool_name   = action.tool_name if hasattr(action, "tool_name") else ""
         err_text    = (tr.get("error", "") + " " + tr.get("reason", "")).lower() if isinstance(tr, dict) else ""
 
+<<<<<<< HEAD
+        # Invalid-action penalty: if an execute-tool call failed (success=False),
+        # apply a small negative reward so the model learns to avoid bad calls.
+        tool_name = action.tool_name if hasattr(action, "tool_name") else ""
+        invalid_penalty = 0.0
+        if tool_name not in self._GET_TOOLS and tool_name not in self._PASSIVE_TOOLS:
+            # Check if tool result indicates failure
+            if hasattr(obs, "result") and obs.result is not None:
+                r = obs.result
+                result_data = r.data if hasattr(r, "data") else (r if isinstance(r, dict) else {})
+                if isinstance(result_data, dict) and result_data.get("success") is False:
+                    invalid_penalty = self._config.invalid_action_penalty
+
+        # Repeat-call penalty: penalize calling the same tool twice in a row
+=======
         # ── Shaping: add positive signal for correct workflow steps ───────────
         # Without shaping, real costs make successful steps look worse than
         # doing nothing — the policy gradient would learn to avoid them.
@@ -301,6 +321,7 @@ class StaffingAgencyEnvironment(MCPEnvironment):
             self._last_failed_action = None   # clear on success
 
         # ── Repeat-call penalty (same tool twice, non-GET, not a retry) ───────
+>>>>>>> origin/main
         repeat_penalty = 0.0
         if (tool_name and tool_name == self._last_tool
                 and tool_name not in self._GET_TOOLS
@@ -318,8 +339,15 @@ class StaffingAgencyEnvironment(MCPEnvironment):
         if self._passive_streak > self._config.passive_streak_threshold:
             passive_penalty = self._config.passive_streak_penalty
 
+<<<<<<< HEAD
+        # Re-sync costs after penalties
+        self._state.costs = self.core.costs
+
+        total_reward = tool_reward + passive_penalty + repeat_penalty + invalid_penalty
+=======
         total_reward = (tool_reward + failure_penalty + repeated_fail_penalty
                         + passive_penalty + repeat_penalty)
+>>>>>>> origin/main
         self._state.cumulative_reward += total_reward
 
         # Cumulative-loss early stop: end early when cash has dropped by more

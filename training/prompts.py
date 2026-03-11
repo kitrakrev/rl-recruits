@@ -40,6 +40,12 @@ TOOLS: list[dict] = [
         "description": "See which roles are currently most requested by clients.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
+<<<<<<< HEAD
+        "name": "find_available_projects",
+        "description": "Get list of all open projects needing staffing, with project_id, role_id, developer_type, and bill_rate_weekly.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+=======
         "name": "get_candidate_types",
         "description": "Returns valid developer_type and seniority_level enum values plus skill/composite score ranges. Call this before find_candidate if unsure of valid filter values.",
         "parameters": {"type": "object", "properties": {}}}},
@@ -73,6 +79,7 @@ TOOLS: list[dict] = [
         "parameters": {"type": "object", "properties": {
             "candidate_id": {"type": "string"}}, "required": ["candidate_id"]}}},
     {"type": "function", "function": {
+>>>>>>> origin/main
         "name": "confirm_project",
         "description": "Commit to a project so you can fill its roles. Call find_available_projects first to get valid project_id values.",
         "parameters": {"type": "object", "properties": {
@@ -100,6 +107,16 @@ TOOLS: list[dict] = [
         "description": "Request more time on a project approaching its deadline.",
         "parameters": {"type": "object", "properties": {
             "project_id": {"type": "string"}}, "required": ["project_id"]}}},
+    {"type": "function", "function": {
+        "name": "pass_on_project",
+        "description": "Decline a project you cannot fill. Avoids expiry penalty.",
+        "parameters": {"type": "object", "properties": {
+            "project_id": {"type": "string"}}, "required": ["project_id"]}}},
+    {"type": "function", "function": {
+        "name": "let_go_candidate",
+        "description": "Release a hired candidate from bench. Incurs 2x weekly salary severance.",
+        "parameters": {"type": "object", "properties": {
+            "candidate_id": {"type": "string"}}, "required": ["candidate_id"]}}},
     {"type": "function", "function": {
         "name": "advance_week",
         "description": (

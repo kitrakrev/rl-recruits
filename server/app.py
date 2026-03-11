@@ -22,11 +22,12 @@ Examples:
          -d '{"curriculum_stage": 2, "passive_streak_threshold": 5}'
 """
 import dataclasses
-import functools
+import json
 import os
 from typing import Any
 
-from fastapi import Body, HTTPException
+from fastapi import Body, HTTPException, Request, Response
+from starlette.middleware.base import BaseHTTPMiddleware
 from openenv.core.env_server.http_server import create_app
 from openenv.core.env_server.mcp_types import CallToolAction, CallToolObservation
 
@@ -55,12 +56,46 @@ _default_config = Config(
 # /config/env will affect all subsequent sessions automatically.
 # ---------------------------------------------------------------------------
 app = create_app(
-    env=functools.partial(StaffingAgencyEnvironment, config=_default_config),
+    env=lambda: StaffingAgencyEnvironment(config=_default_config),
     action_cls=CallToolAction,
     observation_cls=CallToolObservation,
     env_name="staffing_agency",
     max_concurrent_envs=1,
 )
+
+# ---------------------------------------------------------------------------
+# Middleware: fix web UI form sending `arguments` as a JSON string instead of dict
+# The HTML form always sends values as strings, but CallToolAction.arguments
+# expects a dict. This middleware intercepts /web/step requests and parses
+# the `arguments` string into a proper JSON object.
+# ---------------------------------------------------------------------------
+
+class _FixArgumentsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == "/web/step" and request.method == "POST":
+            body = await request.body()
+            try:
+                data = json.loads(body)
+                action = data.get("action", {})
+                args = action.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        action["arguments"] = json.loads(args)
+                    except (json.JSONDecodeError, ValueError):
+                        action["arguments"] = {}
+                    data["action"] = action
+                    body = json.dumps(data).encode()
+
+                    # Rebuild request with fixed body
+                    from starlette.datastructures import MutableHeaders
+                    async def fixed_body():
+                        return body
+                    request._body = body
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return await call_next(request)
+
+app.add_middleware(_FixArgumentsMiddleware)
 
 # ---------------------------------------------------------------------------
 # Config API — mounted directly on the FastAPI app returned by create_app

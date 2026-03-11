@@ -28,11 +28,15 @@ Why not TRL's GRPOTrainer?
 """
 from __future__ import annotations
 
+import os
 import random
 import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+# Reduce CUDA memory fragmentation — critical for 8B models on 80GB GPUs.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 if TYPE_CHECKING:
     from training.config import TrainingConfig
@@ -119,10 +123,16 @@ def train_grpo(cfg: "TrainingConfig") -> None:
     model = get_peft_model(base_model, lora_cfg)
     model.print_trainable_parameters()
 
+<<<<<<< HEAD
+    # Enable gradient checkpointing to trade compute for VRAM.
+    # Essential for 8B models on 80GB GPUs — saves ~50% activation memory.
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+=======
     # Gradient checkpointing: recompute activations during backward instead of
     # storing them during forward — trades ~30% compute for large VRAM savings.
     model.enable_input_require_grads()   # needed by PEFT for gradient checkpointing
     base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+>>>>>>> origin/main
 
     # Only optimise the LoRA adapter parameters
     optimizer = torch.optim.AdamW(
@@ -230,10 +240,16 @@ def train_grpo(cfg: "TrainingConfig") -> None:
         n_opt_steps = 0   # optimizer.step() calls (one per accum_steps micro-batches)
         skipped = 0
 
+<<<<<<< HEAD
+        for batch_start in range(0, len(indices), cfg.train_batch_size):
+            batch_idx  = indices[batch_start : batch_start + cfg.train_batch_size]
+            batch_loss_accum = 0.0  # scalar accumulator (no graph retention)
+=======
         # Track accumulated gradients across micro-batches
         accum_loss   = 0.0   # scalar sum for logging
         accum_terms  = 0     # valid steps accumulated so far
         micro_count  = 0     # micro-batches since last optimizer.step
+>>>>>>> origin/main
 
         optimizer.zero_grad()
 
@@ -273,12 +289,51 @@ def train_grpo(cfg: "TrainingConfig") -> None:
 
                 completion_ids = full_ids[:, comp_start:]
 
+<<<<<<< HEAD
+                # Reference log-probs FIRST (no grad) — compute before the
+                # policy forward pass so the policy graph is the only thing
+                # in memory when we call .backward().
+                with torch.no_grad(), model.disable_adapter():
+                    ref_logits = model(full_ids).logits[:, comp_start - 1 : -1, :]
+                    ref_log_p  = F.log_softmax(ref_logits, dim=-1)
+                    ref_tok_lp = ref_log_p.gather(2, completion_ids.unsqueeze(-1)).squeeze(-1)
+
+                # Policy log-probs (LoRA adapters active)
+                logits    = model(full_ids).logits[:, comp_start - 1 : -1, :]
+=======
                 # Policy log-probs (LoRA active, use_cache=False saves VRAM)
                 logits    = model(full_ids, use_cache=False).logits[:, comp_start - 1 : -1, :]
+>>>>>>> origin/main
                 log_probs = F.log_softmax(logits, dim=-1)
                 tok_lp    = log_probs.gather(2, completion_ids.unsqueeze(-1)).squeeze(-1)
                 avg_log_p = tok_lp.mean()
 
+<<<<<<< HEAD
+                # Per-token KL: p * (log p − log q)
+                kl = (tok_lp.exp() * (tok_lp - ref_tok_lp)).mean()
+                ep_kl_sum += kl.item()
+
+                step_loss  = (-adv * avg_log_p + cfg.kl_coeff * kl) / len(batch_idx)
+
+                # Backward PER SAMPLE — gradients accumulate in .grad buffers
+                # but the computation graph is freed immediately, so only ONE
+                # sample's activations live in VRAM at a time.
+                step_loss.backward()
+                batch_loss_accum += step_loss.item()
+
+                # Free intermediate tensors before next sample
+                del logits, log_probs, tok_lp, ref_logits, ref_log_p, ref_tok_lp
+                del full_ids, prompt_ids, completion_ids
+                torch.cuda.empty_cache()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            ep_loss_sum += batch_loss_accum
+            all_losses.append(batch_loss_accum)
+            n_batches += 1
+=======
                 # Reference log-probs: base model (LoRA disabled, no graph)
                 with torch.no_grad(), model.disable_adapter():
                     ref_logits = model(full_ids, use_cache=False).logits[:, comp_start - 1 : -1, :]
@@ -300,6 +355,7 @@ def train_grpo(cfg: "TrainingConfig") -> None:
                 del logits, log_probs, tok_lp, avg_log_p
                 del ref_logits, ref_log_p, ref_tok_lp, kl, step_loss
                 del prompt_ids, full_ids, completion_ids
+>>>>>>> origin/main
 
             accum_loss  += micro_loss
             accum_terms += micro_terms

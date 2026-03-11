@@ -20,10 +20,9 @@ from typing import Any
 @dataclass
 class TrainingConfig:
     # --- Model ---
-    # Qwen3-0.6B: lightweight for fast iteration / smoke testing.
-    # Same architecture as Qwen3-8B — enable_thinking=False, <tool_call> format,
-    # and LoRA all apply identically. Upgrade to Qwen/Qwen3-8B for production.
-    model_name: str = "Qwen/Qwen3-0.6B"
+    # Qwen3-4B: recommended minimum for RL — reliable tool-call formatting.
+    # Same architecture as Qwen3-8B — enable_thinking=False, <tool_call> format.
+    model_name: str = "Qwen/Qwen3-4B"
 
     # --- LoRA ---
     lora_rank: int = 16             # adapter rank (higher = more capacity)

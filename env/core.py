@@ -74,8 +74,13 @@ class StaffingCore:
         ]
 
         replenish_market(self.market, self.config, self.rng)
-        # Force initial projects to exist at step 0 so agent has work
-        tick_project_arrivals(self.clients, self.config, self.rng)
+        # Force initial projects to exist at step 0 so agent has work.
+        # Poisson arrivals can produce 0 projects (~60% of the time with λ=0.5),
+        # so keep trying until every client has at least one project.
+        for _attempt in range(20):
+            tick_project_arrivals(self.clients, self.config, self.rng)
+            if all(cl.projects for cl in self.clients):
+                break
 
     def world_tick(self) -> float:
         """Run step logic: billing, bench costs, project arrivals, deadlines."""
@@ -678,7 +683,11 @@ class StaffingCore:
         project.update_fill_status()
 
         sealed_now = project.fill_status == "SEALED"
-        reward = 0.0
+
+        # Immediate placement reward: give agent clear positive signal for a successful match.
+        # Positive-margin placements get an immediate bonus (1 week of margin).
+        # Negative-margin placements get 0 here (the loss shows at advance_week).
+        reward = max(c.margin_weekly, 0.0)
 
         if client:
             evt_type = "project_sealed" if sealed_now else ("adjacent_match" if match_score < 1.0 else "partial_fill")
@@ -772,7 +781,9 @@ class StaffingCore:
         project.update_fill_status()
 
         sealed_now = project.fill_status == "SEALED"
-        reward = 0.0
+
+        # Immediate placement reward (same as sync version)
+        reward = max(c.margin_weekly, 0.0)
 
         if client:
             evt_type = "project_sealed" if sealed_now else ("adjacent_match" if match_score < 1.0 else "partial_fill")

@@ -40,3 +40,6 @@ Thumbs.db
 .env.*
 
 wandb/
+
+training/reward_curves.png
+training/metrics_summary.json
